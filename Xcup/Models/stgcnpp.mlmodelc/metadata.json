@@ -1,0 +1,67 @@
+[
+  {
+    "metadataOutputVersion" : "3.0",
+    "storagePrecision" : "Float16",
+    "outputSchema" : [
+      {
+        "hasShapeFlexibility" : "0",
+        "isOptional" : "0",
+        "dataType" : "Float32",
+        "formattedType" : "MultiArray (Float32)",
+        "shortDescription" : "",
+        "shape" : "[]",
+        "name" : "var_608",
+        "type" : "MultiArray"
+      }
+    ],
+    "modelParameters" : [
+
+    ],
+    "specificationVersion" : 6,
+    "mlProgramOperationTypeHistogram" : {
+      "Matmul" : 10,
+      "Linear" : 1,
+      "Cast" : 2,
+      "Conv" : 22,
+      "Relu" : 20,
+      "Transpose" : 12,
+      "Add" : 9,
+      "BatchNorm" : 11,
+      "Reshape" : 34,
+      "ReduceMean" : 2
+    },
+    "computePrecision" : "Mixed (Float16, Float32, Int32)",
+    "isUpdatable" : "0",
+    "stateSchema" : [
+
+    ],
+    "availability" : {
+      "macOS" : "12.0",
+      "tvOS" : "15.0",
+      "visionOS" : "1.0",
+      "watchOS" : "8.0",
+      "iOS" : "15.0",
+      "macCatalyst" : "15.0"
+    },
+    "modelType" : {
+      "name" : "MLModelType_mlProgram"
+    },
+    "userDefinedMetadata" : {
+
+    },
+    "inputSchema" : [
+      {
+        "hasShapeFlexibility" : "0",
+        "isOptional" : "0",
+        "dataType" : "Float32",
+        "formattedType" : "MultiArray (Float32 1 × 3 × 32 × 17 × 1)",
+        "shortDescription" : "",
+        "shape" : "[1, 3, 32, 17, 1]",
+        "name" : "input",
+        "type" : "MultiArray"
+      }
+    ],
+    "generatedClassName" : "stgcnpp",
+    "method" : "predict"
+  }
+]
