@@ -272,7 +272,7 @@ class OnlineAnalysisViewController: UIViewController {
 
         // 说明文字
         let descLabel = UILabel()
-        descLabel.text = "点击下方红色按钮，在弹出的系统对话框中选择「Xcup」\n即开始在线视频模式，可以返回桌面，观看在线视频"
+        descLabel.text = "点击下方红色按钮，在弹出的系统对话框中选择「开始直播」即开始在线视频模式，可以返回桌面，观看在线视频。所有信息皆在本地处理，不会上传至服务器。"
         descLabel.font = UIFont.systemFont(ofSize: 15)
         descLabel.textColor = UIColor(white: 0.75, alpha: 1)
         descLabel.textAlignment = .center
