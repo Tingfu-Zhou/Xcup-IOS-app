@@ -109,6 +109,27 @@ struct ContentView: View {
                     .font(.caption)
                     .foregroundColor(.gray)
                 
+                
+
+                // [修改] 在线模式按钮（使用 ReplayKit 采集屏幕与系统音频，类似腾讯会议共享屏幕方式）
+                Button(action: {
+                    showOnlineAnalysis = true
+                }) {
+                    Label("在线视频模式", systemImage: "record.circle")
+                        .font(.title2)
+                        .padding()
+                        .frame(maxWidth: .infinity)
+                        .background(Color.purple)
+                        .foregroundColor(.white)
+                        .cornerRadius(12)
+                        .padding(.horizontal)
+                }
+                .padding(.top, 6)
+                .fullScreenCover(isPresented: $showOnlineAnalysis) {
+                    OnlineAnalysisView()
+                        .ignoresSafeArea()
+                }
+                
                 // [新增] 恢复控制按钮
                 Button(action: {
                     handleResumeControl()
@@ -124,25 +145,6 @@ struct ContentView: View {
                 }
                 .disabled(!isBluetoothPaused)
                 .opacity(isBluetoothPaused ? 1.0 : 0.5)
-
-                // [修改] 在线模式按钮（使用 ReplayKit 采集屏幕与系统音频，类似腾讯会议共享屏幕方式）
-                Button(action: {
-                    showOnlineAnalysis = true
-                }) {
-                    Label("在线模式", systemImage: "record.circle")
-                        .font(.title2)
-                        .padding()
-                        .frame(maxWidth: .infinity)
-                        .background(Color.red.opacity(0.85))
-                        .foregroundColor(.white)
-                        .cornerRadius(12)
-                        .padding(.horizontal)
-                }
-                .padding(.top, 6)
-                .fullScreenCover(isPresented: $showOnlineAnalysis) {
-                    OnlineAnalysisView()
-                        .ignoresSafeArea()
-                }
 
                 Spacer()
 

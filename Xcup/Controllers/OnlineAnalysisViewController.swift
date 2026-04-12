@@ -257,7 +257,7 @@ class OnlineAnalysisViewController: UIViewController {
 
         // 图标
         let iconLabel = UILabel()
-        iconLabel.text = "📡"
+        iconLabel.text = ""
         iconLabel.font = UIFont.systemFont(ofSize: 60)
         iconLabel.textAlignment = .center
         iconLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -272,7 +272,7 @@ class OnlineAnalysisViewController: UIViewController {
 
         // 说明文字
         let descLabel = UILabel()
-        descLabel.text = "点击下方红色按钮，在弹出的系统对话框中选择「Xcup」\n即可开始采集全系统音频输出和屏幕画面"
+        descLabel.text = "点击下方红色按钮，在弹出的系统对话框中选择「Xcup」\n即开始在线视频模式，可以返回桌面，观看在线视频"
         descLabel.font = UIFont.systemFont(ofSize: 15)
         descLabel.textColor = UIColor(white: 0.75, alpha: 1)
         descLabel.textAlignment = .center
