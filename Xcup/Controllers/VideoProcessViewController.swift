@@ -844,7 +844,7 @@ class VideoProcessViewController: UIViewController {
                 }
                 
                 // 线程安全地存储结果
-                self.analysisResults.audioResult = (audioClass, confidence, Date().timeIntervalSince1970 * 1000)
+                self.analysisResults.audioResult = (audioClass, finalConfidence, Date().timeIntervalSince1970 * 1000)
         
                 print(String(format: "✅ 🎵 [音频线程] 音频类型 = %@, 概率 = %.3f", audioClass, confidence))
             } else {
