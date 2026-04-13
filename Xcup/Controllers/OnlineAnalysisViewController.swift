@@ -27,7 +27,7 @@ class OnlineAnalysisViewController: UIViewController {
     private let tvVideoAction     = UILabel()
     private let tvAudioAction     = UILabel()
     private let tvOverlay         = UILabel()
-    private let tvDiag            = UILabel()
+    // private let tvDiag            = UILabel()
     private let btnStop           = UIButton(type: .system)
     private var broadcastPicker:  RPSystemBroadcastPickerView?
 
@@ -35,10 +35,10 @@ class OnlineAnalysisViewController: UIViewController {
     private let startOverlay      = UIView()
 
     // MARK: - 诊断计数器
-    private var audioChunksReceived  = 0
-    private var videoFramesReceived  = 0
-    private var rawAudioReceived     = 0   // 扩展侧 .audioApp 原始到达次数
-    private var lastDiagUpdate: TimeInterval = 0
+    // private var audioChunksReceived  = 0
+    // private var videoFramesReceived  = 0
+    // private var rawAudioReceived     = 0   // 扩展侧 .audioApp 原始到达次数
+    // private var lastDiagUpdate: TimeInterval = 0
 
     // MARK: - IPC 读端
     private var audioReader: AudioRingReader?
@@ -49,7 +49,7 @@ class OnlineAnalysisViewController: UIViewController {
     private var videoToken:    AnyObject?
     private var startToken:    AnyObject?
     private var stopToken:     AnyObject?
-    private var rawAudioToken: AnyObject?   // 诊断令牌
+    // private var rawAudioToken: AnyObject?   // 诊断令牌
 
     // MARK: - 广播状态
     private var isBroadcasting = false
@@ -155,7 +155,7 @@ class OnlineAnalysisViewController: UIViewController {
         if let t = videoToken    { unregisterDarwinObserver(t) }
         if let t = startToken    { unregisterDarwinObserver(t) }
         if let t = stopToken     { unregisterDarwinObserver(t) }
-        if let t = rawAudioToken { unregisterDarwinObserver(t) }
+        // if let t = rawAudioToken { unregisterDarwinObserver(t) }
     }
 
     // MARK: - UI 布局
@@ -209,6 +209,7 @@ class OnlineAnalysisViewController: UIViewController {
         ])
 
         // 诊断面板
+        /*
         tvDiag.translatesAutoresizingMaskIntoConstraints = false
         tvDiag.numberOfLines = 0
         tvDiag.textColor     = .cyan
@@ -223,6 +224,7 @@ class OnlineAnalysisViewController: UIViewController {
             tvDiag.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
             tvDiag.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -16)
         ])
+        */
 
         // ── 未广播时的居中覆盖层（在诊断面板之后加入，遮住背景内容）──
         setupStartOverlay()
@@ -383,11 +385,13 @@ class OnlineAnalysisViewController: UIViewController {
         }
 
         // 诊断：扩展侧首条 .audioApp 样本到达（处理前）的通知
+        /*
         rawAudioToken = registerDarwinObserver(name: kDarwinAudioRaw) { [weak self] in
             guard let self else { return }
             self.rawAudioReceived += 1
             self.refreshDiagIfNeeded()
         }
+        */
     }
 
     // MARK: - 广播启动处理（由 startToken 触发，或由首条音视频数据兜底触发）
@@ -399,13 +403,13 @@ class OnlineAnalysisViewController: UIViewController {
         let ipcOk = (reader != nil)
         isBroadcasting = true
         startOverlay.isHidden = true
-        tvDiag.isHidden = false
+        // tvDiag.isHidden = false
         if ipcOk {
             statusLabel.text = "Extension 已连接 — 等待声音..."
-            updateDiag(extensionConnected: true, ipcOk: true)
+            // updateDiag(extensionConnected: true, ipcOk: true)
         } else {
             statusLabel.text = "⚠️ App Groups 未配置，数据无法传输"
-            updateDiag(extensionConnected: true, ipcOk: false)
+            // updateDiag(extensionConnected: true, ipcOk: false)
         }
         startAnalysisLoops()
         print("[在线模式] 广播已开始，IPC读端=\(ipcOk ? "就绪" : "失败（检查App Groups配置）")")
@@ -421,8 +425,8 @@ class OnlineAnalysisViewController: UIViewController {
         pcmBuffer.write(samples, startTimestampMs: startMs, sampleRate: 16000)
         handleSilenceDetection(samples: samples)
 
-        audioChunksReceived += 1
-        refreshDiagIfNeeded()
+        // audioChunksReceived += 1
+        // refreshDiagIfNeeded()
     }
 
     // MARK: - 新视频帧回调（Darwin 通知线程，非主线程）
@@ -439,8 +443,8 @@ class OnlineAnalysisViewController: UIViewController {
         latestFrame = image
         frameLock.unlock()
 
-        videoFramesReceived += 1
-        refreshDiagIfNeeded()
+        // videoFramesReceived += 1
+        // refreshDiagIfNeeded()
 
         DispatchQueue.main.async { [weak self] in
             self?.previewImageView.image = image
@@ -448,7 +452,7 @@ class OnlineAnalysisViewController: UIViewController {
     }
 
     // MARK: - 诊断面板更新
-
+    /*
     private func updateDiag(extensionConnected: Bool, ipcOk: Bool) {
         let extIcon = extensionConnected ? "🟢" : "⬛"
         let ipcNote = ipcOk ? "" : " ⚠️ App Groups 未配置"
@@ -488,6 +492,7 @@ class OnlineAnalysisViewController: UIViewController {
             """
         }
     }
+    */
 
     // MARK: - 静音检测
 
@@ -523,11 +528,11 @@ class OnlineAnalysisViewController: UIViewController {
         audioLoopItem?.cancel()
         fusionLoopItem?.cancel()
         audioReader = nil
-        audioChunksReceived = 0
-        videoFramesReceived = 0
+        // audioChunksReceived = 0
+        // videoFramesReceived = 0
         // 重新显示启动覆盖层
         startOverlay.isHidden = false
-        tvDiag.isHidden = true
+        // tvDiag.isHidden = true
     }
 
     // MARK: - 启动三路分析循环
@@ -629,6 +634,8 @@ class OnlineAnalysisViewController: UIViewController {
                 if score < 0 { action = "Noise"; score = 1.0 }
 
                 self.analysisResults.videoResult = (action, score, Date().timeIntervalSince1970 * 1000)
+                print(String(format: "📸 [在线-视频] 识别结果: %@ (p=%.3f) | oral=%.3f, do=%.3f, noise=%.3f",
+                      action, score, probOral, probDo, noiseProb))
                 DispatchQueue.main.async {
                     self.tvVideoAction.text = String(format: "V: %@ (%.2f)", action, score)
                 }
@@ -647,6 +654,7 @@ class OnlineAnalysisViewController: UIViewController {
                 var cls = classes[index]; var conf = confidence
                 if cls == "Noise" && conf < 0.6 { cls = "do"; conf = 1.0 - conf }
                 analysisResults.audioResult = (cls, conf, Date().timeIntervalSince1970 * 1000)
+                print(String(format: "🎵 [在线-音频] 识别结果: %@ (p=%.3f)", cls, conf))
                 DispatchQueue.main.async { self.tvAudioAction.text = String(format: "A: %@ (%.2f)", cls, conf) }
             }
         }
@@ -701,11 +709,11 @@ class OnlineAnalysisViewController: UIViewController {
         if BluetoothManager.shared.isConnected && !BluetoothManager.shared.isPausedByLocal {
             BluetoothManager.shared.sendAction("Noise", 0)
         }
-        refreshDiagIfNeeded()
+        // refreshDiagIfNeeded()
     }
     private func resumeAnalysis() {
         isAnalysisPaused = false
-        refreshDiagIfNeeded()
+        // refreshDiagIfNeeded()
     }
 
     // MARK: - 停止
