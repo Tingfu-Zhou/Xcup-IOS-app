@@ -174,8 +174,8 @@ class VideoProcessViewController: UIViewController {
     private var audioLoudnessEstimator: AudioLoudnessLevelEstimator!
 
     
-    // MARK: - 🆕 视频节奏器
-    private var videoRhythmEstimator: VideoRhythmEstimator!
+    // MARK: - 🆕 视频节奏器（基于 ROI 块运动 + PCA 主方向 + 自相关）
+    private var videoRhythmEstimator: VideoMotionWaveEstimator!
     
     // MARK: - 抽帧
     var videoFrameExtractor: VideoFrameExtractor!
@@ -497,8 +497,8 @@ class VideoProcessViewController: UIViewController {
         // 🆕 初始化音频节奏器
         // audioRhythmEstimator = AudioRhythmEstimator(sampleRateHz: 16000)
         audioLoudnessEstimator = AudioLoudnessLevelEstimator(sampleRate: 16000)
-        // 🆕 初始化视频节奏器
-        videoRhythmEstimator = VideoRhythmEstimator()
+        // 🆕 初始化视频节奏器（块运动版本）
+        videoRhythmEstimator = VideoMotionWaveEstimator()
     }
 
     // MARK: - 音频初始化
@@ -659,28 +659,36 @@ class VideoProcessViewController: UIViewController {
             
         inferenceHelper.runPoseModel(on: currentFrame) { [weak self] keypoints in
             guard let self = self else { return }
-                
+
             let poseDetectionTime = Date().timeIntervalSince(poseDetectionStart) * 1000
             //print(String(format: "🦴 [视频线程] ML Kit Pose Detection 耗时: %.2f ms", poseDetectionTime))
-                
+
+            let framePtsMs = Int64(Date().timeIntervalSince1970 * 1000)
+
+            // 🆕 关键点为 nil（未检测到人）→ 触发节律器场景切换处理；ST-GCN++ 跳过本帧
             guard let keypoints = keypoints else {
-                //print("当前帧未检测到人体")
+                self.videoRhythmEstimator.pushFrame(timestampMs: framePtsMs, frame: nil, keypointsNorm: nil)
+                self.analysisResults.videoFreq = (hz: .nan, conf: 0, tsMs: framePtsMs)
                 return
             }
-            // 🆕 将归一化后的关键点推入视频节律器
-            let framePtsMs = Int64(Date().timeIntervalSince1970 * 1000)
-            self.videoRhythmEstimator.onPoseFrame(kps: keypoints, ptsMs: framePtsMs)
-                    
-            // 🆕 拉取最新估计值并存储
-            let freqHz = self.videoRhythmEstimator.getLatestFreqHz()
-            let conf = self.videoRhythmEstimator.getLatestConf()
-            let tsMs = self.videoRhythmEstimator.getLatestTsMs()
-                    
-            // 存储到线程安全的结果容器
-            self.analysisResults.videoFreq = (hz: freqHz, conf: conf, tsMs: tsMs)
-            // 打印调试信息
-            if !freqHz.isNaN {
-                print(String(format: "[频率测试] 视频节奏 - 频率:%.2f Hz, 置信度:%.2f", freqHz, conf))
+
+            // 🆕 将归一化后的关键点 + 当前帧一并推入视频节律器
+            self.videoRhythmEstimator.pushFrame(timestampMs: framePtsMs,
+                                                frame: currentFrame,
+                                                keypointsNorm: keypoints)
+            let vr = self.videoRhythmEstimator.getLatestResult()
+
+            if vr.valid {
+                self.analysisResults.videoFreq = (hz: vr.freqHz,
+                                                   conf: vr.confidence,
+                                                   tsMs: vr.timestampMs)
+                print(String(format: "[频率测试] [离线模式] 视频运动波形 - f=%.2fHz, conf=%.2f, per=%.2f, mE=%.3f, dir=(%.2f,%.2f), pos01=%.2f, locked=%@",
+                             vr.freqHz, vr.confidence, vr.periodicity, vr.motionEnergy,
+                             vr.mainDirX, vr.mainDirY, vr.position01,
+                             vr.locked ? "true" : "false"))
+                print("[VideoWave] " + vr.debugInfo)
+            } else {
+                self.analysisResults.videoFreq = (hz: .nan, conf: 0, tsMs: framePtsMs)
             }
                 
             // 在视频分析队列中处理

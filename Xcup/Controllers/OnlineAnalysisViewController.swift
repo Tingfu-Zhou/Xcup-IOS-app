@@ -64,7 +64,7 @@ class OnlineAnalysisViewController: UIViewController {
     private var inferenceHelper:        InferenceHelper!
     private var audioHelper:            AudioInferenceHelper!
     private var audioLoudnessEstimator: AudioLoudnessLevelEstimator!
-    private var videoRhythmEstimator:   VideoRhythmEstimator!
+    private var videoRhythmEstimator:   VideoMotionWaveEstimator!
     private var pcmBuffer:              PcmCircularBuffer!
     private let analysisResults =       ThreadSafeAnalysisResults()
 
@@ -346,7 +346,7 @@ class OnlineAnalysisViewController: UIViewController {
         inferenceHelper.setupPoseDetector()
         audioHelper            = AudioInferenceHelper()
         audioLoudnessEstimator = AudioLoudnessLevelEstimator(sampleRate: 16000)
-        videoRhythmEstimator   = VideoRhythmEstimator()
+        videoRhythmEstimator   = VideoMotionWaveEstimator()
         pcmBuffer              = PcmCircularBuffer(sampleRate: 16000, capacityInSeconds: 20)
     }
 
@@ -601,14 +601,32 @@ class OnlineAnalysisViewController: UIViewController {
         guard let frame = frame else { return }
 
         inferenceHelper.runPoseModel(on: frame) { [weak self] keypoints in
-            guard let self = self, let keypoints = keypoints else { return }
+            guard let self = self else { return }
             let framePtsMs = Int64(Date().timeIntervalSince1970 * 1000)
-            self.videoRhythmEstimator.onPoseFrame(kps: keypoints, ptsMs: framePtsMs)
-            self.analysisResults.videoFreq = (
-                hz:   self.videoRhythmEstimator.getLatestFreqHz(),
-                conf: self.videoRhythmEstimator.getLatestConf(),
-                tsMs: self.videoRhythmEstimator.getLatestTsMs()
-            )
+
+            // 🆕 关键点为 nil（未检测到人）→ 触发节律器场景切换处理；ST-GCN++ 跳过本帧
+            guard let keypoints = keypoints else {
+                self.videoRhythmEstimator.pushFrame(timestampMs: framePtsMs, frame: nil, keypointsNorm: nil)
+                self.analysisResults.videoFreq = (hz: .nan, conf: 0, tsMs: framePtsMs)
+                return
+            }
+
+            self.videoRhythmEstimator.pushFrame(timestampMs: framePtsMs,
+                                                frame: frame,
+                                                keypointsNorm: keypoints)
+            let vr = self.videoRhythmEstimator.getLatestResult()
+            if vr.valid {
+                self.analysisResults.videoFreq = (hz: vr.freqHz,
+                                                   conf: vr.confidence,
+                                                   tsMs: vr.timestampMs)
+                print(String(format: "[频率测试] [在线模式] 视频运动波形 - f=%.2fHz, conf=%.2f, per=%.2f, mE=%.3f, dir=(%.2f,%.2f), pos01=%.2f, locked=%@",
+                             vr.freqHz, vr.confidence, vr.periodicity, vr.motionEnergy,
+                             vr.mainDirX, vr.mainDirY, vr.position01,
+                             vr.locked ? "true" : "false"))
+                print("[VideoWave] " + vr.debugInfo)
+            } else {
+                self.analysisResults.videoFreq = (hz: .nan, conf: 0, tsMs: framePtsMs)
+            }
             self.videoAnalysisQueue.async {
                 self.poseWindow.append(keypoints)
                 if self.poseWindow.count > self.WINDOW_SIZE { self.poseWindow.removeFirst() }
