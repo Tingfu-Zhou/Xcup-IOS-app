@@ -749,23 +749,128 @@ class OnlineAnalysisViewController: UIViewController {
         }
     }
 
-    // MARK: - ===== 以下与 VideoProcessViewController 逻辑完全一致 =====
+    // 🆕 MARK: - 计算最终节律档位
+    // 计算最终节律档位：优先使用视频节律；如果视频节律为空/无效，则回退使用音频响度档位。
+    // 音频仍保留“置信度阈值 + 方向性门控（涨档更严格、降档更宽松）”这一套逻辑。
+    private func computeFinalFreq(
+        audioHz: Float, audioConf: Float,
+        videoHz: Float, videoConf: Float
+    ) -> Int {
 
-    private func computeFinalFreq(audioHz: Float, audioConf: Float,
-                                   videoHz: Float, videoConf: Float) -> Int {
-        var finalFreq = clampLevelFromLoudness(audioHz)
-        let CONF_IGNORE: Float = 0.10; let CONF_UP: Float = 0.10; let CONF_DOWN: Float = 0.10
-        let curLevel = self.currentLevel; let candidateLevel = finalFreq
-        if audioHz.isNaN || audioConf < CONF_IGNORE { return curLevel }
-        if candidateLevel > curLevel && audioConf < CONF_UP   { finalFreq = curLevel }
-        else if candidateLevel < curLevel && audioConf < CONF_DOWN { finalFreq = curLevel }
+        // [ADD] 判断视频节律是否有效：videoHz 不是 NaN 且大于 0
+        let useVideoFreq = !videoHz.isNaN && videoHz > 0
+
+        // [ADD] 根据当前实际来源选择候选档位、置信度、来源名称
+        var finalFreq: Int
+        let selectedConf: Float
+        let rhythmSource: String
+
+        if useVideoFreq {
+            // [ADD] 视频节律有效：优先使用视频 Hz 映射档位
+            finalFreq = mapFreqToLevel(videoHz)
+            selectedConf = videoConf
+            rhythmSource = "视频节律"
+
+            NSLog(
+                "[最终节律] 使用来源=%@, videoHz=%.3fHz, videoConf=%.2f, candidateLevel=%d",
+                rhythmSource, videoHz, videoConf, finalFreq
+            )
+        } else {
+            // [ADD] 视频节律无效：回退使用音频响度档位
+            finalFreq = clampLevelFromLoudness(audioHz)  // [MOD] audioHz 实际承载的是 loudness level
+            selectedConf = audioConf
+            rhythmSource = "音频响度"
+
+            NSLog(
+                "[最终节律] 使用来源=%@, 原因=videoHz为NaN或<=0, audioLevelLike=%.3f, audioConf=%.2f, candidateLevel=%d",
+                rhythmSource, audioHz, audioConf, finalFreq
+            )
+        }
+
+        // [ADD] 保留两路原始结果日志，方便对比排查
+        let audioLevel = clampLevelFromLoudness(audioHz)
+        let videoLevel = mapFreqToLevel(videoHz)
+
+        NSLog(
+            "[视频节律] 得到视频节律: %.3f 置信度: %.3f 档位: %d",
+            videoHz, videoConf, videoLevel
+        )
+
+        NSLog(
+            "[音频响度] 得到音频档位: %.3f 置信度: %.3f 档位: %d",
+            audioHz, audioConf, audioLevel
+        )
+
+        // === 方向性置信度门控（涨档更严格，降档更宽松） ===
+        let CONF_IGNORE: Float = 0.10   // 极低置信度：整体忽略本次节律
+        let CONF_UP: Float     = 0.10   // 涨档所需置信度
+        let CONF_DOWN: Float   = 0.10   // 降档所需置信度
+
+        let curLevel = self.currentLevel
+        let candidateLevel = finalFreq
+
+        // [ADD] 当前实际来源是否无效
+        let selectedInvalid = useVideoFreq ? videoHz.isNaN : audioHz.isNaN
+
+        // 1) 极低置信度 or 无效频率：直接忽略，沿用 currentLevel
+        if selectedInvalid || selectedConf < CONF_IGNORE {
+            NSLog(
+                "[最终节律] 来源=%@, conf=%.2f < CONF_IGNORE=%.2f，本次节律整体忽略，沿用 currentLevel=%d",
+                rhythmSource, selectedConf, CONF_IGNORE, curLevel
+            )
+            finalFreq = curLevel
+            return finalFreq
+        }
+
+        // 2) 按“变档方向”应用不同门槛
+        if candidateLevel > curLevel && selectedConf < CONF_UP {
+            NSLog(
+                "[最终节律] 来源=%@，尝试涨档 %d→%d 但 conf=%.2f < CONF_UP=%.2f，本次不生效，沿用 currentLevel=%d",
+                rhythmSource, curLevel, candidateLevel, selectedConf, CONF_UP, curLevel
+            )
+            finalFreq = curLevel
+        } else if candidateLevel < curLevel && selectedConf < CONF_DOWN {
+            NSLog(
+                "[最终节律] 来源=%@，尝试降档 %d→%d 但 conf=%.2f < CONF_DOWN=%.2f，本次不生效，沿用 currentLevel=%d",
+                rhythmSource, curLevel, candidateLevel, selectedConf, CONF_DOWN, curLevel
+            )
+            finalFreq = curLevel
+        }
+        // candidateLevel == curLevel：无需处理
+
+        NSLog(
+            "[最终节律] 最终使用来源=%@, 输出档位=%d",
+            rhythmSource, finalFreq
+        )
+
         return finalFreq
     }
-
-    private func clampLevelFromLoudness(_ v: Float) -> Int {
-        if v.isNaN { return 0 }
-        return max(0, min(9, Int(v.rounded())))
+    
+    // === 🆕 把 Hz 映射为 0..9 档（0为停止），10档也当作第9档 ===
+    // 等工厂确定值后，只需替换 LEVEL_RANGES 即可
+    private func mapFreqToLevel(_ hz: Float) -> Int {
+        if hz.isNaN || hz <= 0 {
+            return 0
+        }
+        for lvl in 1...9 {
+            if let range = LEVEL_RANGES[lvl],
+               range.contains(hz) {
+                return lvl
+            }
+        }
+        return 9 // 超出则钳到最高档
     }
+    
+    // [ADD] audioHz 实际承载的是 loudness level（Float），这里钳制到 0..9
+    private func clampLevelFromLoudness(_ levelLike: Float) -> Int {
+        if levelLike.isNaN { return 0 }
+        var lv = Int(levelLike.rounded())
+        if lv < 0 { lv = 0 }
+        if lv > 9 { lv = 9 }
+        return lv
+    }
+    
+    // MARK: - ===== 以下与 VideoProcessViewController 逻辑完全一致 =====
 
     private func smoothedFusion(videoAction: String, audioAction: String,
                                  videoConf: Float, audioConf: Float) -> String {

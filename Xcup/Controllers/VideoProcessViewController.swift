@@ -682,11 +682,13 @@ class VideoProcessViewController: UIViewController {
                 self.analysisResults.videoFreq = (hz: vr.freqHz,
                                                    conf: vr.confidence,
                                                    tsMs: vr.timestampMs)
+                /*
                 print(String(format: "[频率测试] [离线模式] 视频运动波形 - f=%.2fHz, conf=%.2f, per=%.2f, mE=%.3f, dir=(%.2f,%.2f), pos01=%.2f, locked=%@",
                              vr.freqHz, vr.confidence, vr.periodicity, vr.motionEnergy,
                              vr.mainDirX, vr.mainDirY, vr.position01,
                              vr.locked ? "true" : "false"))
-                print("[VideoWave] " + vr.debugInfo)
+                */
+                // print("[VideoWave] " + vr.debugInfo)
             } else {
                 self.analysisResults.videoFreq = (hz: .nan, conf: 0, tsMs: framePtsMs)
             }
@@ -1076,53 +1078,101 @@ class VideoProcessViewController: UIViewController {
     
     
     // 🆕 MARK: - 计算最终节律档位
-    // 计算最终节律档位：当前先以“音频节律”为主，但带置信度阈值 + 方向性门控（涨档更严格、降档更宽松）
+    // 计算最终节律档位：优先使用视频节律；如果视频节律为空/无效，则回退使用音频响度档位。
+    // 音频仍保留“置信度阈值 + 方向性门控（涨档更严格、降档更宽松）”这一套逻辑。
     private func computeFinalFreq(
         audioHz: Float, audioConf: Float,
         videoHz: Float, videoConf: Float
     ) -> Int {
 
-        // 先做“临时策略”：candidate 仍以音频为主（后续要融合音视频节律，就只改这里）
-        // var finalFreq = mapFreqToLevel(audioHz)
-        var finalFreq = clampLevelFromLoudness(audioHz)  // [MOD] audioHz 实际承载的是 loudness level
+        // [ADD] 判断视频节律是否有效：videoHz 不是 NaN 且大于 0
+        let useVideoFreq = !videoHz.isNaN && videoHz > 0
 
-        let videoLvl = mapFreqToLevel(videoHz)
+        // [ADD] 根据当前实际来源选择候选档位、置信度、来源名称
+        var finalFreq: Int
+        let selectedConf: Float
+        let rhythmSource: String
 
-        // 日志：对齐 Android，方便你对比
-        NSLog("[视频节律] 得到视频节律: %.3f 置信度: %.3f 档位: %d", videoHz, videoConf, videoLvl)
-        NSLog("[音频节律] 得到音频节律: %.3f 置信度: %.3f 档位: %d", audioHz, audioConf, finalFreq)
+        if useVideoFreq {
+            // [ADD] 视频节律有效：优先使用视频 Hz 映射档位
+            finalFreq = mapFreqToLevel(videoHz)
+            selectedConf = videoConf
+            rhythmSource = "视频节律"
+
+            NSLog(
+                "[最终节律] 使用来源=%@, videoHz=%.3fHz, videoConf=%.2f, candidateLevel=%d",
+                rhythmSource, videoHz, videoConf, finalFreq
+            )
+        } else {
+            // [ADD] 视频节律无效：回退使用音频响度档位
+            finalFreq = clampLevelFromLoudness(audioHz)  // [MOD] audioHz 实际承载的是 loudness level
+            selectedConf = audioConf
+            rhythmSource = "音频响度"
+
+            NSLog(
+                "[最终节律] 使用来源=%@, 原因=videoHz为NaN或<=0, audioLevelLike=%.3f, audioConf=%.2f, candidateLevel=%d",
+                rhythmSource, audioHz, audioConf, finalFreq
+            )
+        }
+
+        // [ADD] 保留两路原始结果日志，方便对比排查
+        let audioLevel = clampLevelFromLoudness(audioHz)
+        let videoLevel = mapFreqToLevel(videoHz)
+
+        NSLog(
+            "[视频节律] 得到视频节律: %.3f 置信度: %.3f 档位: %d",
+            videoHz, videoConf, videoLevel
+        )
+
+        NSLog(
+            "[音频响度] 得到音频档位: %.3f 置信度: %.3f 档位: %d",
+            audioHz, audioConf, audioLevel
+        )
 
         // === 方向性置信度门控（涨档更严格，降档更宽松） ===
         let CONF_IGNORE: Float = 0.10   // 极低置信度：整体忽略本次节律
-        let CONF_UP: Float     = 0.10   // 涨档所需置信度（更严格）
-        let CONF_DOWN: Float   = 0.10   // 降档所需置信度（相对宽松）
+        let CONF_UP: Float     = 0.10   // 涨档所需置信度
+        let CONF_DOWN: Float   = 0.10   // 降档所需置信度
 
-        let curLevel = self.currentLevel              // 当前已生效档位（0..10）:contentReference[oaicite:2]{index=2}
-        let candidateLevel = finalFreq                // 本次根据 audioHz 映射出的档位
+        let curLevel = self.currentLevel
+        let candidateLevel = finalFreq
 
-        // 1) 极低置信度 or 无效频率：直接忽略，沿用 currentLevel（不给 updateBluetoothState 变档机会）
-        if audioHz.isNaN || audioConf < CONF_IGNORE {
-            NSLog("[音频节律] conf=%.2f < CONF_IGNORE=%.2f，本次节律整体忽略，沿用 currentLevel=%d",
-                  audioConf, CONF_IGNORE, curLevel)
+        // [ADD] 当前实际来源是否无效
+        let selectedInvalid = useVideoFreq ? videoHz.isNaN : audioHz.isNaN
+
+        // 1) 极低置信度 or 无效频率：直接忽略，沿用 currentLevel
+        if selectedInvalid || selectedConf < CONF_IGNORE {
+            NSLog(
+                "[最终节律] 来源=%@, conf=%.2f < CONF_IGNORE=%.2f，本次节律整体忽略，沿用 currentLevel=%d",
+                rhythmSource, selectedConf, CONF_IGNORE, curLevel
+            )
             finalFreq = curLevel
             return finalFreq
         }
 
         // 2) 按“变档方向”应用不同门槛
-        if candidateLevel > curLevel && audioConf < CONF_UP {
-            NSLog("[音频节律] 尝试涨档 %d→%d 但 conf=%.2f < CONF_UP=%.2f，本次不生效，沿用 currentLevel=%d",
-                  curLevel, candidateLevel, audioConf, CONF_UP, curLevel)
+        if candidateLevel > curLevel && selectedConf < CONF_UP {
+            NSLog(
+                "[最终节律] 来源=%@，尝试涨档 %d→%d 但 conf=%.2f < CONF_UP=%.2f，本次不生效，沿用 currentLevel=%d",
+                rhythmSource, curLevel, candidateLevel, selectedConf, CONF_UP, curLevel
+            )
             finalFreq = curLevel
-        } else if candidateLevel < curLevel && audioConf < CONF_DOWN {
-            NSLog("[音频节律] 尝试降档 %d→%d 但 conf=%.2f < CONF_DOWN=%.2f，本次不生效，沿用 currentLevel=%d",
-                  curLevel, candidateLevel, audioConf, CONF_DOWN, curLevel)
+        } else if candidateLevel < curLevel && selectedConf < CONF_DOWN {
+            NSLog(
+                "[最终节律] 来源=%@，尝试降档 %d→%d 但 conf=%.2f < CONF_DOWN=%.2f，本次不生效，沿用 currentLevel=%d",
+                rhythmSource, curLevel, candidateLevel, selectedConf, CONF_DOWN, curLevel
+            )
             finalFreq = curLevel
         }
         // candidateLevel == curLevel：无需处理
 
+        NSLog(
+            "[最终节律] 最终使用来源=%@, 输出档位=%d",
+            rhythmSource, finalFreq
+        )
+
         return finalFreq
     }
-
 
         
     // 🆕 MARK: - 时间窗口平滑融合方法
