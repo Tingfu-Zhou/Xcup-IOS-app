@@ -245,9 +245,9 @@ class OnlineAnalysisViewController: UIViewController {
         // ── 未广播时的居中覆盖层（在诊断面板之后加入，遮住背景内容）──
         setupStartOverlay()
 
-        // 停止按钮：MD3 Error Filled stadium，z 轴最高
+        // 返回主页面按钮：z 轴最高，始终在覆盖层之上可点击
         btnStop.translatesAutoresizingMaskIntoConstraints = false
-        btnStop.setTitle("停止", for: .normal)
+        btnStop.setTitle("返回主页面", for: .normal)
         btnStop.setTitleColor(.md3OnError, for: .normal)
         btnStop.backgroundColor    = .md3Error
         btnStop.layer.cornerRadius = 20
@@ -258,7 +258,7 @@ class OnlineAnalysisViewController: UIViewController {
         NSLayoutConstraint.activate([
             btnStop.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
             btnStop.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 12),
-            btnStop.widthAnchor.constraint(equalToConstant: 80),
+            btnStop.widthAnchor.constraint(equalToConstant: 120),
             btnStop.heightAnchor.constraint(equalToConstant: 40)
         ])
     }
