@@ -1169,7 +1169,7 @@ class VideoProcessViewController: UIViewController {
                 // 包括Noise在内的所有动作都参与评分
                 let videoKey = record.videoAction
                 var score = actionScores[videoKey] ?? 0
-                score += record.videoConfidence * weight * 0.7 // 视频权重稍低
+                score += record.videoConfidence * weight * 0.8 // 视频权重稍低
                 actionScores[videoKey] = score
                     
                 let count = actionCounts[videoKey] ?? 0
@@ -1181,7 +1181,7 @@ class VideoProcessViewController: UIViewController {
                 // 包括Noise在内的所有动作都参与评分
                 let audioKey = record.audioAction
                 var score = actionScores[audioKey] ?? 0
-                score += record.audioConfidence * weight * 1.3 // 音频权重更高
+                score += record.audioConfidence * weight * 1.2 // 音频权重更高
                 actionScores[audioKey] = score
                     
                 let count = actionCounts[audioKey] ?? 0
