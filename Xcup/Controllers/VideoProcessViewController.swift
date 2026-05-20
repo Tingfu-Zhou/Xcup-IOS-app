@@ -165,17 +165,19 @@ class VideoProcessViewController: UIViewController {
     var videoURL: URL!
 
     // MARK: - 推理和蓝牙
-    var inferenceHelper: InferenceHelper!
+    // 旧的 ML Kit + ST-GCN++ 已弃用，统一替换为 MobileNetV3Small 三分类
+    // var inferenceHelper: InferenceHelper!
+    var videoClassifier: VideoClassifierHelper!
     var audioHelper: AudioInferenceHelper!
-    
+
     // MARK: - 🆕 音频节奏器
     // private var audioRhythmEstimator: AudioRhythmEstimator!
     // 音频响度档位估计器（替代音频节奏器）
     private var audioLoudnessEstimator: AudioLoudnessLevelEstimator!
 
-    
-    // MARK: - 🆕 视频节奏器（基于 ROI 块运动 + PCA 主方向 + 自相关）
-    private var videoRhythmEstimator: VideoMotionWaveEstimator!
+
+    // MARK: - 🆕 视频节奏器（已移除：现在统一用音频节律）
+    // private var videoRhythmEstimator: VideoMotionWaveEstimator!
     
     // MARK: - 抽帧
     var videoFrameExtractor: VideoFrameExtractor!
@@ -197,23 +199,38 @@ class VideoProcessViewController: UIViewController {
     private var fusionTimer: Timer?
     
     // ===================== [12.14] 自调度循环（替代 repeating timer） =====================
-    private let VIDEO_INTERVAL_MS: Int64 = 100           // 视频 100ms
+    private let VIDEO_INTERVAL_MS: Int64 = 250           // 视频抽帧轮询 250ms
+    private let VIDEO_INFER_STEP_MS: Int64 = 1000        // 视频推理步长 1s
     private let AUDIO_INTERVAL_MS: Int64 = 1000          // 音频 1s
-    private let FUSION_INTERVAL_MS: Int64 = 800          // 融合 800ms（与 0.8s 对齐）
+    private let FUSION_INTERVAL_MS: Int64 = 1000         // 融合 1s
 
     private var videoLoopWorkItem: DispatchWorkItem?
     private var audioLoopWorkItem: DispatchWorkItem?
     private var fusionLoopWorkItem: DispatchWorkItem?
-    
+
+    // MARK: - 视频分类滑动窗口（12 帧 × 160×160 × RGB，3s 窗口，1s 推理步长）
+    private let FRAME_BUFFER_SIZE: Int = VideoClassifierHelper.TIME  // 12
+    private var frameBuffer: [UIImage] = []
+    private var lastVideoInferenceMs: Int64 = 0
+
+    // MARK: - 视频置信度阈值（单一阈值 0.4，低于即视为 unclear）
+    private let VIDEO_CONF_TH: Float = 0.4
+
+    // MARK: - 音频置信度阈值（与 Android 对齐）
+    private let AUDIO_TH_NOISE: Float = 0.6              // 噪音类：>=0.6 才认定为 Noise
+    private let AUDIO_TH_ACTION: Float = 0.5             // sex/oral：>=0.5 才认定为 do
+
+    /* ---- 旧版姿态窗口（ST-GCN++）已弃用 ----
     var poseWindow: [PoseFrame] = []
     let WINDOW_SIZE = 32
-    
+
     // MARK: - 二分类相关参数
     var poseWindow8: [PoseFrame] = []  // 8帧二分类窗口
     let BINARY_WINDOW = 8             // 二分类窗口大小
     let BINARY_TH: Float = 0.3        // 二分类阈值
     let MULTI_STEP = 8                // 多分类步长
     var framesSinceLastMulti = 0      // 多分类帧计数器
+    */
     
     // MARK: - 平滑融合相关
     private var actionHistory = [ActionRecord]()  // 动作历史记录
@@ -222,7 +239,7 @@ class VideoProcessViewController: UIViewController {
     private var latestBluetoothAction = ""       // 最新的蓝牙发送动作
     
     // MARK: -主线程融合循环间隔（秒）
-    private let FUSION_INTERVAL: TimeInterval = 0.8  // 800ms
+    private let FUSION_INTERVAL: TimeInterval = 1.0  // 1000ms
     
     // MARK: - 蓝牙状态管理相关
     private var pendingBluetoothState = ""           // 待确认的蓝牙状态
@@ -492,13 +509,19 @@ class VideoProcessViewController: UIViewController {
 
     // MARK: - 推理初始化
     func setupInference() {
-        inferenceHelper = InferenceHelper()
-        inferenceHelper.setupPoseDetector()
+        // 旧的 ML Kit + ST-GCN++ 已弃用：
+        // inferenceHelper = InferenceHelper()
+        // inferenceHelper.setupPoseDetector()
+
+        // 视频改为 MobileNetV3Small 三分类
+        videoClassifier = VideoClassifierHelper()
+
         // 🆕 初始化音频节奏器
         // audioRhythmEstimator = AudioRhythmEstimator(sampleRateHz: 16000)
         audioLoudnessEstimator = AudioLoudnessLevelEstimator(sampleRate: 16000)
-        // 🆕 初始化视频节奏器（块运动版本）
-        videoRhythmEstimator = VideoMotionWaveEstimator()
+
+        // 🆕 初始化视频节奏器（已移除）
+        // videoRhythmEstimator = VideoMotionWaveEstimator()
     }
 
     // MARK: - 音频初始化
@@ -626,11 +649,16 @@ class VideoProcessViewController: UIViewController {
 
 
     // MARK: - 视频分析线程（后台线程）
+    //
+    // 每 250ms 一轮：抽 1 帧 → 缩放到 160×160 → 推入环形缓冲（最多 12 帧 = 3 秒窗口）
+    //   若 缓冲 < 12 帧：return（预热）
+    //   若 now - lastVideoInferenceMs < 1000ms：return
+    //   否则：classifier.predict(12帧) → applyVideoResult()
     func performVideoAnalysis() {
         guard !isAnalysisPaused else { return }
-            
+
         let currentTime = player.currentTime().seconds
-            
+
         if currentTime >= videoDuration {
             DispatchQueue.main.async { [weak self] in
                 if !(self?.isVideoCompleted ?? true) {
@@ -641,174 +669,81 @@ class VideoProcessViewController: UIViewController {
             }
             return
         }
-            
+
         // 1. 抽帧
-        let frameExtractionStart = Date()
-            
         guard let extractor = videoFrameExtractor,
-              let currentFrame = extractor.frame(at: Int64(currentTime * 1_000_000)) else {
+              let rawFrame = extractor.frame(at: Int64(currentTime * 1_000_000)) else {
             print("未能提取帧")
             return
         }
-            
-        let frameExtractionTime = Date().timeIntervalSince(frameExtractionStart) * 1000
-        //print(String(format: "📸 [视频线程] 抽帧耗时: %.2f ms", frameExtractionTime))
-            
-        // 2. ML Kit 姿态检测（异步）
-        let poseDetectionStart = Date()
-            
-        inferenceHelper.runPoseModel(on: currentFrame) { [weak self] keypoints in
-            guard let self = self else { return }
 
-            let poseDetectionTime = Date().timeIntervalSince(poseDetectionStart) * 1000
-            //print(String(format: "🦴 [视频线程] ML Kit Pose Detection 耗时: %.2f ms", poseDetectionTime))
-
-            let framePtsMs = Int64(Date().timeIntervalSince1970 * 1000)
-
-            // 🆕 关键点为 nil（未检测到人）→ 触发节律器场景切换处理；ST-GCN++ 跳过本帧
-            guard let keypoints = keypoints else {
-                self.videoRhythmEstimator.pushFrame(timestampMs: framePtsMs, frame: nil, keypointsNorm: nil)
-                self.analysisResults.videoFreq = (hz: .nan, conf: 0, tsMs: framePtsMs)
-                return
-            }
-
-            // 🆕 将归一化后的关键点 + 当前帧一并推入视频节律器
-            self.videoRhythmEstimator.pushFrame(timestampMs: framePtsMs,
-                                                frame: currentFrame,
-                                                keypointsNorm: keypoints)
-            let vr = self.videoRhythmEstimator.getLatestResult()
-
-            if vr.valid {
-                self.analysisResults.videoFreq = (hz: vr.freqHz,
-                                                   conf: vr.confidence,
-                                                   tsMs: vr.timestampMs)
-                /*
-                print(String(format: "[频率测试] [离线模式] 视频运动波形 - f=%.2fHz, conf=%.2f, per=%.2f, mE=%.3f, dir=(%.2f,%.2f), pos01=%.2f, locked=%@",
-                             vr.freqHz, vr.confidence, vr.periodicity, vr.motionEnergy,
-                             vr.mainDirX, vr.mainDirY, vr.position01,
-                             vr.locked ? "true" : "false"))
-                */
-                // print("[VideoWave] " + vr.debugInfo)
-            } else {
-                self.analysisResults.videoFreq = (hz: .nan, conf: 0, tsMs: framePtsMs)
-            }
-                
-            // 在视频分析队列中处理
-            self.videoAnalysisQueue.async {
-                var skipMulti = false
-                /*
-                 🆕 8帧二分类
-                self.poseWindow8.append(keypoints)
-                if self.poseWindow8.count > self.BINARY_WINDOW {
-                    self.poseWindow8.removeFirst()
-                }
-                    
-                if self.poseWindow8.count == self.BINARY_WINDOW {
-                    let binInput = self.poseWindow8.toStgcnInput()
-                    let tStgcnStart = Date()
-                        
-                    if let prob = self.inferenceHelper.runBinary(input: binInput) {
-                        let tStgcnEnd = Date()
-                        let binaryTime = (tStgcnEnd.timeIntervalSince(tStgcnStart)) * 1000
-                        print(String(format: "[计时] [视频线程] 🧠 二分类ST-GCN++ 推理耗时: %.2f ms", binaryTime))
-                            
-                        // 修改：注释掉二分类判断，让skipMulti始终为false
-                        if prob < self.BINARY_TH {
-                            print("[视频线程] [同步分析] 二分类判定为Background")
-                            // 添加时间戳
-                            self.analysisResults.videoResult = ("Background", prob, Date().timeIntervalSince1970 * 1000)
-                            skipMulti = true
-                        }
-                    }
-                }
-                // 🆕 结束二分类部分
-                */
-                    
-                // 🔴 32帧多分类
-                if !skipMulti {
-                    self.poseWindow.append(keypoints)
-                    if self.poseWindow.count > self.WINDOW_SIZE {
-                        self.poseWindow.removeFirst()
-                    }
-                        
-                    self.framesSinceLastMulti += 1  // 🆕 累积帧计数
-                        
-                    // 🔴 多分类的ST-GCN++ 触发条件：窗口满且已累积 ≥ MULTI_STEP 帧
-                    if self.poseWindow.count == self.WINDOW_SIZE && self.framesSinceLastMulti >= self.MULTI_STEP {
-                        self.framesSinceLastMulti = 0  // 🆕 归零计数器
-                            
-                        var input = self.poseWindow.toStgcnInput()
-                        let stgcnStart = Date()
-                        // [ADD] 对齐 Windows：复刻 MMAction2 PreNormalize2D（align_center=true）
-                        input = ActionUtilsSwift.preNormalize2D(input)
-                            
-                        if let scores = self.inferenceHelper.runStgcnModel(input: input) {
-                            let stgcnTime = Date().timeIntervalSince(stgcnStart) * 1000
-                            //print(String(format: "[计时] [视频线程] 🏃 ST-GCN++ 推理耗时: %.2f ms", stgcnTime))
-                                
-                            let probs = scores.softmax()
-                                
-                            // 合并同类概率
-                            let probOral = probs[0] + probs[1] // oral = label 0 + label 1
-                            let probDoslow = probs[2] + probs[3] + probs[4] + probs[5] // doslow = label 2 + label 3 + label 4 + label 5
-                            // 噪音类分开
-                            let probNoiseStand = probs[6]
-                            let probNoiseSit = probs[7]
-                                
-                            let TargetProb = probOral + probDoslow
-                            let NoiseProb = probNoiseStand + probNoiseSit
-                                
-                            // 比例阈值参数
-                            let NOISE_RATIO_THRESHOLD: Float = 1.5 // β=1.5，噪声需要比目标类高50%才被认定
-                                
-                            var actionClass: String
-                            var bestScore: Float
-                                
-                            // 判定逻辑
-                            if NoiseProb > TargetProb * NOISE_RATIO_THRESHOLD {
-                                // 噪声显著高于目标类
-                                if probNoiseStand > probNoiseSit {
-                                    actionClass = "Noise"
-                                    bestScore = 0.0
-                                } else {
-                                    actionClass = "Noise"
-                                    bestScore = 0.0
-                                }
-                            } else {
-                                // 在目标类中选择
-                                if probOral > probDoslow {
-                                    actionClass = "oral"
-                                    bestScore = probOral
-                                } else {
-                                    actionClass = "do"
-                                    bestScore = probDoslow
-                                }
-                            }
-                                
-                            //采用置信度阈值法，若最大概率 < 阈值 T（如0.0），则强制判为"杂音"类别,否则按照原有 argmax 判别类别。
-                            let threshold: Float = 0.0
-                            if bestScore < threshold {
-                                actionClass = "Noise"
-                                bestScore = 1.0
-                                print(String(format: "📸 视频分析判定为 Noise (最大概率=%.3f < 阈值)", bestScore))
-                            } else {
-                                print(String(format: "📸 视频识别结果: %@ (p=%.2f)", actionClass, bestScore))
-                                //print(String(format: "[视频线程] 概率分布: oral=%.3f, doslow=%.3f, noise_stand=%.3f, noise_sit=%.3f",probOral, probDoslow, probNoiseStand, probNoiseSit))
-                            }
-                                
-                            // 线程安全地存储结果
-                            self.analysisResults.videoResult = (actionClass, bestScore, Date().timeIntervalSince1970 * 1000)
-                                
-                            //print(String(format: "[视频线程] 视频类型 = %@, 概率 = %.3f", actionClass, bestScore))
-                        }
-                    }
-                } else {
-                    // 🆕 若被判为 Background，清空窗口 & 重置计数
-                    // self.poseWindow.removeAll()
-                    // self.framesSinceLastMulti = 0
-                }
-            }
+        // 2. 缩放为 160×160（RGB 在分类器内部统一处理）
+        guard let frame160 = VideoClassifierHelper.resizeTo160(rawFrame) else {
+            print("❌ [视频线程] 帧缩放失败")
+            return
         }
+
+        // 3. 推入环形缓冲（最多 12 帧）
+        frameBuffer.append(frame160)
+        if frameBuffer.count > FRAME_BUFFER_SIZE {
+            frameBuffer.removeFirst(frameBuffer.count - FRAME_BUFFER_SIZE)
+        }
+
+        // 4. 预热不足
+        if frameBuffer.count < FRAME_BUFFER_SIZE {
+            return
+        }
+
+        // 5. 推理步长门控（1000ms）
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        if nowMs - lastVideoInferenceMs < VIDEO_INFER_STEP_MS {
+            return
+        }
+        lastVideoInferenceMs = nowMs
+
+        // 6. 推理
+        let inferStart = Date()
+        guard let result = videoClassifier.predict(frames: frameBuffer) else {
+            print("❌ [视频线程] MobileNetV3 推理失败")
+            return
+        }
+        let inferMs = Date().timeIntervalSince(inferStart) * 1000
+        let probs = result.probs
+
+        // 7. 阈值映射（单一阈值 0.4，低于则 unclear）
+        //    索引 0=normal_plot -> "Noise"（不转）
+        //    索引 1=oral / 2=sex -> "do"（转）
+        //    低于阈值 -> ""（unclear），融合层自然消化
+        let action: String
+        let confidence: Float
+
+        if result.index < 0 {
+            action = ""
+            confidence = 0
+        } else if result.confidence < VIDEO_CONF_TH {
+            action = ""
+            confidence = 0
+            print(String(format: "📸 视频 unclear: 最大概率=%.3f < 阈值=%.2f (idx=%d)",
+                         result.confidence, VIDEO_CONF_TH, result.index))
+        } else if result.index == 0 {
+            action = "Noise"
+            confidence = result.confidence
+        } else {
+            // index == 1 (oral) 或 2 (sex)
+            action = "do"
+            confidence = result.confidence
+        }
+
+        print(String(format: "📸 [视频线程] 推理 %.1fms | %@ p=%.3f | normal=%.3f oral=%.3f sex=%.3f",
+                     inferMs,
+                     action.isEmpty ? "(unclear)" : action,
+                     confidence,
+                     probs.count > 0 ? probs[0] : 0,
+                     probs.count > 1 ? probs[1] : 0,
+                     probs.count > 2 ? probs[2] : 0))
+
+        // 8. 写入线程安全结果（unclear 也写入，让融合层去消化空字符串）
+        self.analysisResults.videoResult = (action, confidence, Date().timeIntervalSince1970 * 1000)
     }
 
 
@@ -827,39 +762,51 @@ class VideoProcessViewController: UIViewController {
         let segment = pcmBuffer.readWindowRelaxed(currentTimeMs: currentTimeMs, sampleCount: 32000)
         if let segment = segment {
             let yamnetStart = Date()
-            
+
             let (index, confidence) = audioHelper.predict(audioBuffer: segment)
-            
+
             let yamnetTime = Date().timeIntervalSince(yamnetStart) * 1000
             //print(String(format: "🎵 [音频线程] YAMNet 音频分析耗时: %.2f ms", yamnetTime))
-            
-            let audioClasses = ["do", "oral", "Noise"]
-            let threshold: Float = 0.0 // 置信度阈值
-            
-            var finalIndex = index
-            var finalConfidence = confidence   // 可变置信度
-            
-            if finalIndex >= 0 && finalIndex < audioClasses.count {
-                // 阈值法：最大概率小于阈值则判为"004"杂音
-                if confidence < threshold {
-                    finalIndex = audioClasses.count - 1
-                    print(String(format: "🎵 音频分析判定为 Noise (最大概率=%.3f < 阈值)", confidence))
-                }
-                var audioClass = audioClasses[finalIndex]
-                // Noise 比例阈值纠偏逻辑 （Android 对齐）
-                if audioClass == "Noise" && finalConfidence < 0.6 {
-                    audioClass = "do"
-                    finalConfidence = 1.0 - finalConfidence
-                    NSLog("[同步分析] Noise置信度过低(%.3f)，转换为 do，新置信度=%.3f",confidence, finalConfidence)
-                }
-                
-                // 线程安全地存储结果
-                self.analysisResults.audioResult = (audioClass, finalConfidence, Date().timeIntervalSince1970 * 1000)
-        
-                print(String(format: "✅ 🎵 [音频线程] 音频类型 = %@, 概率 = %.3f", audioClass, confidence))
-            } else {
+
+            // YAMNet + 微调分类器输出索引：0=do(sex), 1=oral, 2=Noise
+            //   index<0 → "" (unclear)
+            //   index==2 noise: 置信度 ≥ AUDIO_TH_NOISE → "Noise"，否则 unclear
+            //   index==0/1 sex/oral: 置信度 ≥ AUDIO_TH_ACTION → "do"，否则 unclear
+            let action: String
+            let outConf: Float
+
+            if index < 0 {
+                action = ""
+                outConf = 0
                 print("⚠️ [音频线程] 音频分析返回了无效索引: \(index)")
+            } else if index == 2 {
+                if confidence >= AUDIO_TH_NOISE {
+                    action = "Noise"
+                    outConf = confidence
+                } else {
+                    action = ""
+                    outConf = 0
+                    print(String(format: "🎵 [音频线程] Noise unclear: p=%.3f < %.2f",
+                                 confidence, AUDIO_TH_NOISE))
+                }
+            } else {
+                // index == 0 (sex) 或 1 (oral) → "do"
+                if confidence >= AUDIO_TH_ACTION {
+                    action = "do"
+                    outConf = confidence
+                } else {
+                    action = ""
+                    outConf = 0
+                    print(String(format: "🎵 [音频线程] do unclear: p=%.3f < %.2f (idx=%d)",
+                                 confidence, AUDIO_TH_ACTION, index))
+                }
             }
+
+            // 线程安全地存储结果（unclear 也写入：交由融合层做投票消化）
+            self.analysisResults.audioResult = (action, outConf, Date().timeIntervalSince1970 * 1000)
+
+            print(String(format: "✅ 🎵 [音频线程] 音频类型 = %@, 原始idx=%d, 原始p=%.3f",
+                         action.isEmpty ? "(unclear)" : action, index, confidence))
         }
         
         /*
@@ -919,26 +866,24 @@ class VideoProcessViewController: UIViewController {
     // MARK: - 融合和UI更新（主线程）
     func performFusion() {
         guard !isAnalysisPaused else { return }
-            
+
         let videoResult = analysisResults.videoResult
         let audioResult = analysisResults.audioResult
         // let audioRhythm = analysisResults.audioRhythm
         let loud = analysisResults.audioLoudnessLevel
-        let videoFreq = analysisResults.videoFreq
-            
+        // 视频节律已移除，不再读取 videoFreq
+        // let videoFreq = analysisResults.videoFreq
+
         // 🆕 计算结果的新鲜度（毫秒）
         let currentTime = Date().timeIntervalSince1970 * 1000
         let videoAge = videoResult.timestamp > 0 ? currentTime - videoResult.timestamp : Double.greatestFiniteMagnitude
         let audioAge = audioResult.timestamp > 0 ? currentTime - audioResult.timestamp : Double.greatestFiniteMagnitude
         // let audiofreqAge = audioRhythm.tsMs > 0 ? currentTime - Double(audioRhythm.tsMs) : Double.greatestFiniteMagnitude
         let loudAge = loud.tsMs > 0 ? currentTime - Double(loud.tsMs) : Double.greatestFiniteMagnitude
-        let videofreqAge = videoFreq.tsMs > 0 ? currentTime - Double(videoFreq.tsMs) : Double.greatestFiniteMagnitude
-        
-        // var videoFreq: (hz: Float, conf: Float, tsMs: Int64) {
-            
+
         // 🆕 过滤超过2秒的过期数据
         let MAX_AGE: Double = 2000 // 2秒
-            
+
         var filteredVideoAction = videoResult.action
         var filteredVideoConfidence = videoResult.confidence
         var filteredAudioAction = audioResult.action
@@ -948,10 +893,7 @@ class VideoProcessViewController: UIViewController {
         // var audioFreqConf = audioRhythm.conf
         var audioLevelLike: Float = Float(loud.level)  // 用 level(float) 复用现有 computeFinalFreq 管线
         var audioLevelConf: Float = loud.conf
-        
-        var VideoFreq = videoFreq.hz
-        var VideoFreqConf = videoFreq.conf
-        
+
         /*
         // 如果音频频节奏结果过期或无效，清空它
         if !audioRhythm.valid || audiofreqAge > MAX_AGE {
@@ -963,42 +905,29 @@ class VideoProcessViewController: UIViewController {
             audioLevelLike = .nan
             audioLevelConf = 0.0
         }
-        
-        //如果视频节奏结果过期，清空它
-        if videofreqAge > MAX_AGE {
-            VideoFreq = .nan
-            VideoFreqConf = 0.0
-        }
-            
+
         // 如果视频结果过期，清空它
         if videoAge > MAX_AGE {
             filteredVideoAction = ""
             filteredVideoConfidence = 0
             //print(String(format: "[融合] 视频结果过期（%.0fms），已忽略", videoAge))
         }
-            
+
         // 如果音频结果过期，清空它
         if audioAge > MAX_AGE {
             filteredAudioAction = ""
             filteredAudioConfidence = 0
             //print(String(format: "[融合] 音频结果过期（%.0fms），已忽略", audioAge))
         }
-        
-        if filteredVideoAction == "oral" {
-            filteredVideoAction = "do"
-            NSLog("[融合] 视频动作类型 oral -> do")
-        }
 
-        if filteredAudioAction == "oral" {
-            filteredAudioAction = "do"
-            NSLog("[融合] 音频动作类型 oral -> do")
-        }
+        // 视频/音频统一词表已经是 {"do", "Noise", ""}，不再需要 oral→do 映射
+        // if filteredVideoAction == "oral" { filteredVideoAction = "do" }
+        // if filteredAudioAction == "oral" { filteredAudioAction = "do" }
 
-        // 临时采用音频节律作为最终节律（但通过 computeFinalFreq 做门控，便于后续扩展）
-        // 仍然复用 computeFinalFreq
+        // 视频节律已移除，computeFinalFreq 只依赖音频响度档位
         var finalfreq = computeFinalFreq(
             audioHz: audioLevelLike, audioConf: audioLevelConf,
-            videoHz: VideoFreq, videoConf: VideoFreqConf
+            videoHz: .nan, videoConf: 0
         )
             
         // 更新UI
@@ -1502,25 +1431,30 @@ class VideoProcessViewController: UIViewController {
             
             // 在后台线程中清理数据
             self.videoAnalysisQueue.async {
-                self.poseWindow.removeAll()
-                self.poseWindow8.removeAll()  // 🆕 清空二分类窗口
-                self.framesSinceLastMulti = 0  // 🆕 重置帧计数器
-                
-                // 🆕 重置视频节奏器
-                self.videoRhythmEstimator.reset()
-                
+                // 🆕 清空视频分类滑动窗口
+                self.frameBuffer.removeAll()
+                self.lastVideoInferenceMs = 0
+
+                // 旧的姿态/ST-GCN++ 状态已弃用：
+                // self.poseWindow.removeAll()
+                // self.poseWindow8.removeAll()
+                // self.framesSinceLastMulti = 0
+
+                // 视频节律已移除：
+                // self.videoRhythmEstimator.reset()
+
                 // 🆕 清空动作历史
                 self.historyLock.lock()
                 self.actionHistory.removeAll()
                 self.historyLock.unlock()
-                
+
                 // 重置蓝牙状态
                 self.pendingBluetoothState = ""
                 self.currentBluetoothState = ""
                 self.pendingStateStartTime = 0
                 self.currentStateStartTime = 0
             }
-            
+
             self.audioAnalysisQueue.async {
                 self.pcmBuffer.reset()
                 self.audioDecoder.seekTo(Int(currentMs))
@@ -1627,15 +1561,21 @@ class VideoProcessViewController: UIViewController {
     @objc func videoDidEnd() {
         isVideoCompleted = true
         pauseAnalysis()
-        
-        // 🆕 重置两个节奏器
-        videoRhythmEstimator?.reset()
+
+        // 视频节律已移除：
+        // videoRhythmEstimator?.reset()
         // audioRhythmEstimator?.reset()
         self.audioLoudnessEstimator.reset()
 
         // 重置存储的结果
         analysisResults.resetRhythm()
-        
+
+        // 清空视频分类滑动窗口
+        videoAnalysisQueue.async { [weak self] in
+            self?.frameBuffer.removeAll()
+            self?.lastVideoInferenceMs = 0
+        }
+
         print("视频播放完成，已暂停分析等待用户操作")
     }
 
@@ -1797,11 +1737,11 @@ class VideoProcessViewController: UIViewController {
             print("[退出] 已发送停止信号(Noise)")
         }
         
-        // 🆕 重置两个节奏器
-        videoRhythmEstimator?.reset()
+        // 视频节律已移除：
+        // videoRhythmEstimator?.reset()
         // audioRhythmEstimator?.reset()
         self.audioLoudnessEstimator.reset()
-        
+
         // 停止所有定时器
         videoAnalysisTimer?.cancel()
         audioAnalysisTimer?.cancel()

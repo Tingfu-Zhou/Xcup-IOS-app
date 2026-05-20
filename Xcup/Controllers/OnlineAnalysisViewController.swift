@@ -61,22 +61,34 @@ class OnlineAnalysisViewController: UIViewController {
     private let frameLock = NSLock()
 
     // MARK: - 推理模块
-    private var inferenceHelper:        InferenceHelper!
+    // private var inferenceHelper:        InferenceHelper!     // 已弃用：ML Kit + ST-GCN++
+    private var videoClassifier:        VideoClassifierHelper!  // MobileNetV3Small + TAP + 3class
     private var audioHelper:            AudioInferenceHelper!
     private var audioLoudnessEstimator: AudioLoudnessLevelEstimator!
-    private var videoRhythmEstimator:   VideoMotionWaveEstimator!
+    // private var videoRhythmEstimator:   VideoMotionWaveEstimator!  // 视频节律已移除
     private var pcmBuffer:              PcmCircularBuffer!
     private let analysisResults =       ThreadSafeAnalysisResults()
 
     // MARK: - 分析队列与循环
     private let videoAnalysisQueue = DispatchQueue(label: "com.xcup.online.video",  qos: .userInitiated)
     private let audioAnalysisQueue = DispatchQueue(label: "com.xcup.online.audio",  qos: .userInitiated)
-    private let VIDEO_INTERVAL_MS:  Int64 = 100
-    private let AUDIO_INTERVAL_MS:  Int64 = 1000
-    private let FUSION_INTERVAL_MS: Int64 = 800
+    private let VIDEO_INTERVAL_MS:    Int64 = 250    // 抽帧轮询 250ms
+    private let VIDEO_INFER_STEP_MS:  Int64 = 1000   // 推理步长 1s
+    private let AUDIO_INTERVAL_MS:    Int64 = 1000
+    private let FUSION_INTERVAL_MS:   Int64 = 1000   // 主线程融合 1s
     private var videoLoopItem:  DispatchWorkItem?
     private var audioLoopItem:  DispatchWorkItem?
     private var fusionLoopItem: DispatchWorkItem?
+
+    // MARK: - 视频分类滑动窗口（12 帧 × 160×160，3s 窗口）
+    private let FRAME_BUFFER_SIZE: Int = VideoClassifierHelper.TIME
+    private var frameBuffer: [UIImage] = []
+    private var lastVideoInferenceMs: Int64 = 0
+
+    // MARK: - 阈值（与 VideoProcessViewController 一致）
+    private let VIDEO_CONF_TH:     Float = 0.4
+    private let AUDIO_TH_NOISE:    Float = 0.6
+    private let AUDIO_TH_ACTION:   Float = 0.5
 
     // MARK: - 分析暂停状态
     private let stateLock = NSLock()
@@ -86,11 +98,12 @@ class OnlineAnalysisViewController: UIViewController {
         set { stateLock.lock(); defer { stateLock.unlock() }; _isPaused = newValue }
     }
 
-    // MARK: - 姿态窗口
+    /* 旧版姿态窗口（ST-GCN++），已弃用：
     private var poseWindow: [PoseFrame] = []
     private let WINDOW_SIZE  = 32
     private let MULTI_STEP   = 8
     private var framesSinceLastMulti = 0
+    */
 
     // MARK: - 平滑融合
     private var actionHistory: [ActionRecord] = []
@@ -342,11 +355,13 @@ class OnlineAnalysisViewController: UIViewController {
     // MARK: - 推理模块初始化
 
     private func setupInference() {
-        inferenceHelper        = InferenceHelper()
-        inferenceHelper.setupPoseDetector()
+        // 旧的 ML Kit + ST-GCN++ 已弃用：
+        // inferenceHelper        = InferenceHelper()
+        // inferenceHelper.setupPoseDetector()
+        videoClassifier        = VideoClassifierHelper()
         audioHelper            = AudioInferenceHelper()
         audioLoudnessEstimator = AudioLoudnessLevelEstimator(sampleRate: 16000)
-        videoRhythmEstimator   = VideoMotionWaveEstimator()
+        // videoRhythmEstimator   = VideoMotionWaveEstimator()  // 视频节律已移除
         pcmBuffer              = PcmCircularBuffer(sampleRate: 16000, capacityInSeconds: 20)
     }
 
@@ -530,6 +545,13 @@ class OnlineAnalysisViewController: UIViewController {
         audioReader = nil
         // audioChunksReceived = 0
         // videoFramesReceived = 0
+
+        // 清空视频分类窗口
+        videoAnalysisQueue.async { [weak self] in
+            self?.frameBuffer.removeAll()
+            self?.lastVideoInferenceMs = 0
+        }
+
         // 重新显示启动覆盖层
         startOverlay.isHidden = false
         // tvDiag.isHidden = true
@@ -592,7 +614,11 @@ class OnlineAnalysisViewController: UIViewController {
     }
 
     // MARK: - 视频分析
-
+    //
+    // 每 250ms 一轮：取一帧 → 缩放到 160×160 → 推入环形缓冲（最多 12 帧 = 3 秒窗口）
+    //   若 缓冲 < 12 帧：return（预热）
+    //   若 now - lastVideoInferenceMs < 1000ms：return
+    //   否则：classifier.predict(12帧) → applyVideoResult()
     private func performVideoAnalysis() {
         frameLock.lock()
         let frame = latestFrame
@@ -600,80 +626,125 @@ class OnlineAnalysisViewController: UIViewController {
         frameLock.unlock()
         guard let frame = frame else { return }
 
-        inferenceHelper.runPoseModel(on: frame) { [weak self] keypoints in
-            guard let self = self else { return }
-            let framePtsMs = Int64(Date().timeIntervalSince1970 * 1000)
+        // 1. 缩放为 160×160（在线模式原帧通常是全屏 JPEG，及早压小避免缓冲占用过多内存）
+        guard let frame160 = VideoClassifierHelper.resizeTo160(frame) else {
+            print("❌ [在线-视频] 帧缩放失败")
+            return
+        }
 
-            // 🆕 关键点为 nil（未检测到人）→ 触发节律器场景切换处理；ST-GCN++ 跳过本帧
-            guard let keypoints = keypoints else {
-                self.videoRhythmEstimator.pushFrame(timestampMs: framePtsMs, frame: nil, keypointsNorm: nil)
-                self.analysisResults.videoFreq = (hz: .nan, conf: 0, tsMs: framePtsMs)
-                return
-            }
+        // 2. 推入环形缓冲（最多 12 帧）
+        frameBuffer.append(frame160)
+        if frameBuffer.count > FRAME_BUFFER_SIZE {
+            frameBuffer.removeFirst(frameBuffer.count - FRAME_BUFFER_SIZE)
+        }
 
-            self.videoRhythmEstimator.pushFrame(timestampMs: framePtsMs,
-                                                frame: frame,
-                                                keypointsNorm: keypoints)
-            let vr = self.videoRhythmEstimator.getLatestResult()
-            if vr.valid {
-                self.analysisResults.videoFreq = (hz: vr.freqHz,
-                                                   conf: vr.confidence,
-                                                   tsMs: vr.timestampMs)
-                print(String(format: "[频率测试] [在线模式] 视频运动波形 - f=%.2fHz, conf=%.2f, per=%.2f, mE=%.3f, dir=(%.2f,%.2f), pos01=%.2f, locked=%@",
-                             vr.freqHz, vr.confidence, vr.periodicity, vr.motionEnergy,
-                             vr.mainDirX, vr.mainDirY, vr.position01,
-                             vr.locked ? "true" : "false"))
-                print("[VideoWave] " + vr.debugInfo)
+        // 3. 预热不足
+        if frameBuffer.count < FRAME_BUFFER_SIZE { return }
+
+        // 4. 推理步长门控（1000ms）
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        if nowMs - lastVideoInferenceMs < VIDEO_INFER_STEP_MS { return }
+        lastVideoInferenceMs = nowMs
+
+        // 5. 推理
+        let inferStart = Date()
+        guard let result = videoClassifier.predict(frames: frameBuffer) else {
+            print("❌ [在线-视频] MobileNetV3 推理失败")
+            return
+        }
+        let inferMs = Date().timeIntervalSince(inferStart) * 1000
+        let probs = result.probs
+
+        // 6. 阈值映射（单一阈值 0.4，低于则 unclear）
+        //    索引 0=normal_plot -> "Noise"（不转）
+        //    索引 1=oral / 2=sex -> "do"（转）
+        let action: String
+        let confidence: Float
+
+        if result.index < 0 {
+            action = ""
+            confidence = 0
+        } else if result.confidence < VIDEO_CONF_TH {
+            action = ""
+            confidence = 0
+            print(String(format: "📸 [在线-视频] unclear: 最大概率=%.3f < 阈值=%.2f (idx=%d)",
+                         result.confidence, VIDEO_CONF_TH, result.index))
+        } else if result.index == 0 {
+            action = "Noise"
+            confidence = result.confidence
+        } else {
+            action = "do"
+            confidence = result.confidence
+        }
+
+        print(String(format: "📸 [在线-视频] 推理 %.1fms | %@ p=%.3f | normal=%.3f oral=%.3f sex=%.3f",
+                     inferMs,
+                     action.isEmpty ? "(unclear)" : action,
+                     confidence,
+                     probs.count > 0 ? probs[0] : 0,
+                     probs.count > 1 ? probs[1] : 0,
+                     probs.count > 2 ? probs[2] : 0))
+
+        analysisResults.videoResult = (action, confidence, Date().timeIntervalSince1970 * 1000)
+
+        DispatchQueue.main.async {
+            if action.isEmpty {
+                self.tvVideoAction.text = "V: (unclear)"
             } else {
-                self.analysisResults.videoFreq = (hz: .nan, conf: 0, tsMs: framePtsMs)
-            }
-            self.videoAnalysisQueue.async {
-                self.poseWindow.append(keypoints)
-                if self.poseWindow.count > self.WINDOW_SIZE { self.poseWindow.removeFirst() }
-                self.framesSinceLastMulti += 1
-                guard self.poseWindow.count == self.WINDOW_SIZE,
-                      self.framesSinceLastMulti >= self.MULTI_STEP else { return }
-                self.framesSinceLastMulti = 0
-
-                var input = self.poseWindow.toStgcnInput()
-                input = ActionUtilsSwift.preNormalize2D(input)
-                guard let scores = self.inferenceHelper.runStgcnModel(input: input) else { return }
-
-                let probs     = scores.softmax()
-                let probOral  = probs[0] + probs[1]
-                let probDo    = probs[2] + probs[3] + probs[4] + probs[5]
-                let noiseProb = probs[6] + probs[7]
-                let targetProb = probOral + probDo
-
-                var action: String; var score: Float
-                if noiseProb > targetProb * 1.5 { action = "Noise"; score = 0.0 }
-                else if probOral > probDo         { action = "oral";  score = probOral }
-                else                              { action = "do";    score = probDo }
-                if score < 0 { action = "Noise"; score = 1.0 }
-
-                self.analysisResults.videoResult = (action, score, Date().timeIntervalSince1970 * 1000)
-                print(String(format: "📸 [在线-视频] 识别结果: %@ (p=%.3f) | oral=%.3f, do=%.3f, noise=%.3f",
-                      action, score, probOral, probDo, noiseProb))
-                DispatchQueue.main.async {
-                    self.tvVideoAction.text = String(format: "V: %@ (%.2f)", action, score)
-                }
+                self.tvVideoAction.text = String(format: "V: %@ (%.2f)", action, confidence)
             }
         }
     }
 
     // MARK: - 音频分析
-
+    //
+    // YAMNet + 微调分类器输出索引：0=do(sex), 1=oral, 2=Noise
+    //   index<0 → "" (unclear)
+    //   index==2 noise: 置信度 ≥ AUDIO_TH_NOISE → "Noise"
+    //   index==0/1 sex/oral: 置信度 ≥ AUDIO_TH_ACTION → "do"
     private func performAudioAnalysis() {
         let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
         if let segment = pcmBuffer.readWindowRelaxed(currentTimeMs: nowMs, sampleCount: 32000) {
             let (index, confidence) = audioHelper.predict(audioBuffer: segment)
-            let classes = ["do", "oral", "Noise"]
-            if index >= 0 && index < classes.count {
-                var cls = classes[index]; var conf = confidence
-                if cls == "Noise" && conf < 0.6 { cls = "do"; conf = 1.0 - conf }
-                analysisResults.audioResult = (cls, conf, Date().timeIntervalSince1970 * 1000)
-                print(String(format: "🎵 [在线-音频] 识别结果: %@ (p=%.3f)", cls, conf))
-                DispatchQueue.main.async { self.tvAudioAction.text = String(format: "A: %@ (%.2f)", cls, conf) }
+
+            let action: String
+            let outConf: Float
+
+            if index < 0 {
+                action = ""
+                outConf = 0
+            } else if index == 2 {
+                if confidence >= AUDIO_TH_NOISE {
+                    action = "Noise"
+                    outConf = confidence
+                } else {
+                    action = ""
+                    outConf = 0
+                    print(String(format: "🎵 [在线-音频] Noise unclear: p=%.3f < %.2f",
+                                 confidence, AUDIO_TH_NOISE))
+                }
+            } else {
+                if confidence >= AUDIO_TH_ACTION {
+                    action = "do"
+                    outConf = confidence
+                } else {
+                    action = ""
+                    outConf = 0
+                    print(String(format: "🎵 [在线-音频] do unclear: p=%.3f < %.2f (idx=%d)",
+                                 confidence, AUDIO_TH_ACTION, index))
+                }
+            }
+
+            analysisResults.audioResult = (action, outConf, Date().timeIntervalSince1970 * 1000)
+            print(String(format: "🎵 [在线-音频] 识别结果: %@ (idx=%d, raw_p=%.3f)",
+                         action.isEmpty ? "(unclear)" : action, index, confidence))
+
+            DispatchQueue.main.async {
+                if action.isEmpty {
+                    self.tvAudioAction.text = "A: (unclear)"
+                } else {
+                    self.tvAudioAction.text = String(format: "A: %@ (%.2f)", action, outConf)
+                }
             }
         }
         if let last05s = pcmBuffer.readWindowRelaxed(currentTimeMs: nowMs, sampleCount: 8000) {
@@ -690,28 +761,27 @@ class OnlineAnalysisViewController: UIViewController {
         let vRes     = analysisResults.videoResult
         let aRes     = analysisResults.audioResult
         let loud     = analysisResults.audioLoudnessLevel
-        let vFreqRes = analysisResults.videoFreq
+        // 视频节律已移除
+        // let vFreqRes = analysisResults.videoFreq
         let now      = Date().timeIntervalSince1970 * 1000
         let MAX_AGE  = 2000.0
 
         let vAge    = vRes.timestamp > 0 ? now - vRes.timestamp        : Double.greatestFiniteMagnitude
         let aAge    = aRes.timestamp > 0 ? now - aRes.timestamp        : Double.greatestFiniteMagnitude
         let loudAge = loud.tsMs > 0      ? now - Double(loud.tsMs)     : Double.greatestFiniteMagnitude
-        let vFAge   = vFreqRes.tsMs > 0  ? now - Double(vFreqRes.tsMs) : Double.greatestFiniteMagnitude
 
-        var vAction = vAge  < MAX_AGE ? vRes.action     : ""
-        var aAction = aAge  < MAX_AGE ? aRes.action     : ""
+        let vAction = vAge  < MAX_AGE ? vRes.action     : ""
+        let aAction = aAge  < MAX_AGE ? aRes.action     : ""
         let vConf   = vAge  < MAX_AGE ? vRes.confidence : Float(0)
         let aConf   = aAge  < MAX_AGE ? aRes.confidence : Float(0)
         let aLevel: Float  = (loud.valid && loudAge < MAX_AGE) ? Float(loud.level) : .nan
         let aLConf: Float  = (loud.valid && loudAge < MAX_AGE) ? loud.conf : 0
-        let vHz:    Float  = vFAge < MAX_AGE ? vFreqRes.hz   : .nan
-        let vHzCnf: Float  = vFAge < MAX_AGE ? vFreqRes.conf : 0
 
-        if vAction == "oral" { vAction = "do" }
-        if aAction == "oral" { aAction = "do" }
+        // 视频/音频统一词表已经是 {"do", "Noise", ""}，不再需要 oral→do 映射
+        // if vAction == "oral" { vAction = "do" }
+        // if aAction == "oral" { aAction = "do" }
 
-        let finalFreq   = computeFinalFreq(audioHz: aLevel, audioConf: aLConf, videoHz: vHz, videoConf: vHzCnf)
+        let finalFreq   = computeFinalFreq(audioHz: aLevel, audioConf: aLConf, videoHz: .nan, videoConf: 0)
         let finalAction = smoothedFusion(videoAction: vAction, audioAction: aAction, videoConf: vConf, audioConf: aConf)
 
         if !finalAction.isEmpty { updateBluetoothState(finalAction, finalFreq) }

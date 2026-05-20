@@ -22,8 +22,9 @@ final class VideoFrameExtractor {
     private let imageGenerator: AVAssetImageGenerator
     private let context = CIContext()          // 如需后处理可复用
 
-    /// 建议尺寸（与 ML Kit 兼容, ML Kit 的最低分辨率为 480*360）
-    private let targetSize = CGSize(width: 720, height: 480)
+    // 目标尺寸：与 MobileNetV3Small 视频分类器输入对齐（160×160）。
+    // 注意：maximumSize 只是上限（保持宽高比），最终精确的 160×160 缩放在 VideoClassifierHelper / 控制器层完成。
+    private let targetSize = CGSize(width: 160, height: 160)
     
     init?(url: URL) {
         self.asset = AVURLAsset(url: url)
