@@ -42,131 +42,112 @@ struct ContentView: View {
 
     var body: some View {
         NavigationView {
-            VStack(spacing: 40) {
-                Spacer()
+            VStack(spacing: 0) {
+                MD3TopAppBar()
 
-                // 1️⃣ 选择本地视频
-                PhotosPicker(selection: $selectedItem,
-                             matching: .videos,
-                             photoLibrary: .shared()) {
-                    Label("选择本地视频", systemImage: "film")
-                        .font(.title2)
-                        .padding()
-                        .frame(maxWidth: .infinity)
-                        .background(Color.purple)
-                        .foregroundColor(.white)
-                        .cornerRadius(12)
-                        .padding(.horizontal)
-                }
-                .disabled(isLoadingVideo)
-                .onChange(of: selectedItem) { newItem in
-                    guard let item = newItem else { return }
-                    
-                    Task {
-                        await loadVideoURL(from: item)
-                    }
-                }
-                
-                // 显示加载状态
-                if isLoadingVideo {
-                    ProgressView("正在加载视频...")
-                        .padding()
-                }
-                
-                // 显示错误信息
-                if let error = errorMessage {
-                    Text(error)
-                        .foregroundColor(.red)
-                        .padding()
-                }
-                
-                // [修改] 蓝牙连接按钮 - 改为一键扫描连接
-                Button(action: {
-                    handleBluetoothConnection()
-                }) {
-                    HStack {
-                        if isBluetoothScanning {
-                            ProgressView()
-                                .progressViewStyle(CircularProgressViewStyle(tint: .white))
-                                .scaleEffect(0.8)
-                        } else {
-                            Image(systemName: isBluetoothConnected ? "checkmark.circle.fill" : "dot.radiowaves.left.and.right")
+                ScrollView {
+                    VStack(spacing: 16) {
+                        // 1️⃣ 选择本地视频
+                        PhotosPicker(selection: $selectedItem,
+                                     matching: .videos,
+                                     photoLibrary: .shared()) {
+                            Label("选择本地视频", systemImage: "film")
                         }
-                        Text(isBluetoothConnected ? "已连接设备" : (isBluetoothScanning ? "扫描中..." : "连接蓝牙设备"))
-                    }
-                    .font(.title2)
-                    .padding()
-                    .frame(maxWidth: .infinity)
-                    .background(isBluetoothConnected ? Color.green : Color.purple)
-                    .foregroundColor(.white)
-                    .cornerRadius(12)
-                    .padding(.horizontal)
-                }
-                .disabled(isBluetoothScanning)
-                
-                // [新增] 蓝牙连接状态显示
-                Text("蓝牙状态: \(bluetoothStatusText)")
-                    .font(.caption)
-                    .foregroundColor(.gray)
-                
-                
+                        .buttonStyle(MD3FilledButtonStyle())
+                        .disabled(isLoadingVideo)
+                        .onChange(of: selectedItem) { newItem in
+                            guard let item = newItem else { return }
 
-                // [修改] 在线模式按钮（使用 ReplayKit 采集屏幕与系统音频，类似腾讯会议共享屏幕方式）
-                Button(action: {
-                    showOnlineAnalysis = true
-                }) {
-                    Label("在线视频模式", systemImage: "record.circle")
-                        .font(.title2)
-                        .padding()
-                        .frame(maxWidth: .infinity)
-                        .background(Color.purple)
-                        .foregroundColor(.white)
-                        .cornerRadius(12)
-                        .padding(.horizontal)
-                }
-                .padding(.top, 6)
-                .fullScreenCover(isPresented: $showOnlineAnalysis) {
-                    OnlineAnalysisView()
-                        .ignoresSafeArea()
-                }
-                
-                // [新增] 恢复控制按钮
-                Button(action: {
-                    handleResumeControl()
-                }) {
-                    Text("已暂停app操作，点击恢复")
-                        .font(.title3)
-                        .padding()
-                        .frame(maxWidth: .infinity)
-                        .background(isBluetoothPaused ? Color.orange : Color.gray)
-                        .foregroundColor(.white)
-                        .cornerRadius(12)
-                        .padding(.horizontal)
-                }
-                .disabled(!isBluetoothPaused)
-                .opacity(isBluetoothPaused ? 1.0 : 0.5)
+                            Task {
+                                await loadVideoURL(from: item)
+                            }
+                        }
 
-                Spacer()
+                        // 显示加载状态
+                        if isLoadingVideo {
+                            ProgressView("正在加载视频...")
+                                .tint(.md3Primary)
+                                .font(MD3Typography.bodySmall)
+                                .foregroundColor(.md3OnSurfaceVariant)
+                        }
 
-                // 2️⃣ 隐形 NavigationLink（带 onDisappear 手动复位）
-                NavigationLink(
-                    destination: Group {
-                        if let url = selectedVideoURL {
-                            VideoProcessView(videoURL: url)
-                                .ignoresSafeArea()
-                                .onDisappear {
-                                    showVideoProcessView = false
-                                    // 清理临时文件
-                                    cleanupTempFile(at: url)
+                        // 显示错误信息
+                        if let error = errorMessage {
+                            Text(error)
+                                .foregroundColor(.md3Error)
+                                .font(MD3Typography.bodySmall)
+                        }
+
+                        // [修改] 蓝牙连接按钮 - 改为一键扫描连接
+                        Button(action: {
+                            handleBluetoothConnection()
+                        }) {
+                            HStack(spacing: 8) {
+                                if isBluetoothScanning {
+                                    ProgressView()
+                                        .progressViewStyle(CircularProgressViewStyle(
+                                            tint: isBluetoothConnected ? .md3OnPrimary : .md3OnSecondaryContainer))
+                                        .scaleEffect(0.8)
+                                } else {
+                                    Image(systemName: isBluetoothConnected ? "checkmark.circle.fill" : "dot.radiowaves.left.and.right")
                                 }
-                        } else {
-                            EmptyView()
+                                Text(isBluetoothConnected ? "已连接设备" : (isBluetoothScanning ? "扫描中..." : "连接蓝牙设备"))
+                            }
                         }
-                    },
-                    isActive: $showVideoProcessView,
-                    label: { EmptyView() }
-                )
+                        .applyBluetoothStyle(isConnected: isBluetoothConnected)
+                        .disabled(isBluetoothScanning)
+
+                        // [新增] 蓝牙连接状态显示
+                        Text("蓝牙状态: \(bluetoothStatusText)")
+                            .font(MD3Typography.bodySmall)
+                            .foregroundColor(.md3OnSurfaceVariant)
+
+                        // [修改] 在线模式按钮（使用 ReplayKit 采集屏幕与系统音频，类似腾讯会议共享屏幕方式）
+                        Button(action: {
+                            showOnlineAnalysis = true
+                        }) {
+                            Label("在线视频模式", systemImage: "record.circle")
+                        }
+                        .buttonStyle(MD3FilledButtonStyle())
+                        .fullScreenCover(isPresented: $showOnlineAnalysis) {
+                            OnlineAnalysisView()
+                                .ignoresSafeArea()
+                        }
+
+                        // [新增] 恢复控制按钮
+                        Button(action: {
+                            handleResumeControl()
+                        }) {
+                            Text("已暂停app操作，点击恢复")
+                        }
+                        .buttonStyle(MD3ErrorFilledButtonStyle())
+                        .disabled(!isBluetoothPaused)
+
+                        // 2️⃣ 隐形 NavigationLink（带 onDisappear 手动复位）
+                        NavigationLink(
+                            destination: Group {
+                                if let url = selectedVideoURL {
+                                    VideoProcessView(videoURL: url)
+                                        .ignoresSafeArea()
+                                        .onDisappear {
+                                            showVideoProcessView = false
+                                            // 清理临时文件
+                                            cleanupTempFile(at: url)
+                                        }
+                                } else {
+                                    EmptyView()
+                                }
+                            },
+                            isActive: $showVideoProcessView,
+                            label: { EmptyView() }
+                        )
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.top, 16)
+                    .padding(.bottom, 24)
+                }
             }
+            .background(Color.md3Background.ignoresSafeArea())
             .navigationBarHidden(true)
             .onAppear {
                 checkForUpdate()
