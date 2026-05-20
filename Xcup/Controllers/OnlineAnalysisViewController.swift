@@ -812,12 +812,12 @@ class OnlineAnalysisViewController: UIViewController {
         return 9 // 超出则钳到最高档
     }
     
-    // [ADD] audioHz 实际承载的是 loudness level（Float），这里钳制到 0..9
+    // [ADD] audioHz 实际承载的是 loudness level（Float），这里钳制到 0..8
     private func clampLevelFromLoudness(_ levelLike: Float) -> Int {
         if levelLike.isNaN { return 0 }
         var lv = Int(levelLike.rounded())
         if lv < 0 { lv = 0 }
-        if lv > 9 { lv = 9 }
+        if lv > 8 { lv = 8 }
         return lv
     }
     
@@ -861,57 +861,244 @@ class OnlineAnalysisViewController: UIViewController {
         return ""
     }
 
+    // MARK: - 更新蓝牙状态 - 二级平滑策略
     private func updateBluetoothState(_ newAction: String, _ finalFreq: Int) {
-        let now = Date().timeIntervalSince1970 * 1000
-        if BluetoothManager.shared.isPausedByLocal { return }
-        let supportsLevel = isSexAction(newAction) && currentStateSupportsSpeed()
+        let currentTime = Date().timeIntervalSince1970 * 1000  // ms
+        
+        // 1) 本地暂停保护
+        if BluetoothManager.shared.isPausedByLocal {
+            print("[蓝牙] ⚠️ 设备已暂停App控制，忽略动作: \(newAction)")
+            return
+        }
+        
+        // ===================== [档位确认：立即生效版] =====================
+        // 只根据本轮 newAction 判断是否支持变速。
+        // 不再依赖 currentBluetoothState，避免 Noise -> do/oral 时档位状态不同步。
+        let supportsLevel = isSexAction(newAction)
+        
         if supportsLevel {
-            if finalFreq >= upThreshold(currentLevel) || finalFreq <= downThreshold(currentLevel) {
-                if pendingLevel == nil || pendingLevel! != finalFreq {
-                    pendingLevel = finalFreq; pendingLevelSinceMs = now
-                } else if (now - pendingLevelSinceMs >= LEVEL_STABLE_MS) &&
-                          (now - currentLevelSinceMs >= LEVEL_MIN_DUR_MS) {
-                    currentLevel = pendingLevel!; currentLevelSinceMs = now
-                }
-            } else { pendingLevel = nil }
-        } else { pendingLevel = nil }
-
-        if newAction != pendingBluetoothState { pendingBluetoothState = newAction; pendingStateStartTime = now }
-        let stableMs: TimeInterval = (isSexAction(currentBluetoothState) && newAction == "Noise")
-            ? 2400 : BLUETOOTH_STABLE_CONFIRM_MS
-
-        if pendingBluetoothState == newAction && (now - pendingStateStartTime) >= stableMs {
-            if pendingBluetoothState != currentBluetoothState {
-                if currentBluetoothState.isEmpty || (now - currentStateStartTime) >= BLUETOOTH_MIN_DURATION {
-                    if (now - lastBluetoothSendTime) >= BLUETOOTH_SEND_INTERVAL {
-                        let lvl = supportsLevel ? currentLevel : finalFreq
-                        latestBluetoothAction = pendingBluetoothState
-                        if BluetoothManager.shared.isConnected {
-                            BluetoothManager.shared.sendAction(pendingBluetoothState, lvl)
-                            lastSentLevel = lvl
+            var latestLevel = finalFreq
+            
+            // 安全钳制到 0..8，与 Android 新逻辑一致
+            if latestLevel < 0 { latestLevel = 0 }
+            if latestLevel > 8 { latestLevel = 8 }
+            
+            // 迟滞：只有跨过 currentLevel ± 1 才认为值得处理
+            let worthHandling =
+                latestLevel >= upThreshold(currentLevel) ||
+                latestLevel <= downThreshold(currentLevel)
+            
+            if worthHandling {
+                // 关键修复：
+                // LEVEL_STABLE_MS = 0 时，第一次看到新档位就立即生效，
+                // 不再要求连续两轮融合循环给出同一档位。
+                if LEVEL_STABLE_MS <= 0 &&
+                    (currentTime - currentLevelSinceMs >= LEVEL_MIN_DUR_MS) {
+                    
+                    if latestLevel != currentLevel {
+                        print(String(format: "[档位确认] 立即生效: %d -> %d",
+                                     currentLevel,
+                                     latestLevel))
+                    }
+                    
+                    currentLevel = latestLevel
+                    currentLevelSinceMs = currentTime
+                    pendingLevel = nil
+                    pendingLevelSinceMs = 0
+                    
+                } else {
+                    // 如果以后 LEVEL_STABLE_MS 改成 >0，则走短稳确认逻辑
+                    if pendingLevel == nil || pendingLevel! != latestLevel {
+                        pendingLevel = latestLevel
+                        pendingLevelSinceMs = currentTime
+                        
+                        print(String(format: "[档位确认] 新 pendingLevel=%d，开始等待稳定",
+                                     latestLevel))
+                        
+                    } else {
+                        let dwell = currentTime - pendingLevelSinceMs
+                        let stableOk = dwell >= LEVEL_STABLE_MS
+                        let minDurOk = currentTime - currentLevelSinceMs >= LEVEL_MIN_DUR_MS
+                        
+                        if stableOk && minDurOk {
+                            if pendingLevel! != currentLevel {
+                                print(String(format: "[档位确认] pending 生效: %d -> %d, dwell=%.0fms",
+                                             currentLevel,
+                                             pendingLevel!,
+                                             dwell))
+                            }
+                            
+                            currentLevel = pendingLevel!
+                            currentLevelSinceMs = currentTime
+                            pendingLevel = nil
+                            pendingLevelSinceMs = 0
                         }
-                        currentBluetoothState = pendingBluetoothState
-                        currentStateStartTime = now; lastBluetoothSendTime = now
                     }
                 }
             } else {
-                if supportsLevel && currentLevel != lastSentLevel &&
-                   (now - lastBluetoothSendTime) >= LEVEL_SEND_GAP_MS {
-                    if BluetoothManager.shared.isConnected {
-                        BluetoothManager.shared.sendAction(currentBluetoothState, currentLevel)
-                        lastSentLevel = currentLevel; lastBluetoothSendTime = now
-                    }
-                }
+                // 未跨过迟滞门槛，不处理档位变化
+                pendingLevel = nil
+                pendingLevelSinceMs = 0
             }
+        } else {
+            // Noise 或其他不支持变速的动作，不处理档位
+            pendingLevel = nil
+            pendingLevelSinceMs = 0
+        }
+        // ===================== [档位确认结束] =====================
+        
+        
+        // ===================== [动作待确认] =====================
+        if newAction != pendingBluetoothState {
+            pendingBluetoothState = newAction
+            pendingStateStartTime = currentTime
+            print(String(format: "[蓝牙] 检测到新动作: %@, 等待确认...", newAction))
+        }
+        
+        // 动作稳定确认时间：
+        // 默认 0ms；如果从 do/oral 切到 Noise，则延长到 1000ms，避免动作中突然停。
+        var actionStableMs: TimeInterval = 0
+        if isSexAction(currentBluetoothState) && newAction == "Noise" {
+            actionStableMs = 1000
+        }
+        
+        let actionStableOk =
+            pendingBluetoothState == newAction &&
+            (currentTime - pendingStateStartTime) >= actionStableMs
+        
+        if !actionStableOk {
+            print(String(format: "[蓝牙] 动作尚未稳定: pending=%@, new=%@, 已稳定=%.0fms, 需要=%.0fms",
+                         pendingBluetoothState,
+                         newAction,
+                         currentTime - pendingStateStartTime,
+                         actionStableMs))
+            return
+        }
+        
+        
+        // ===================== 情况 A：动作发生变化 =====================
+        if pendingBluetoothState != currentBluetoothState {
+            
+            let minDurationOk =
+                currentBluetoothState.isEmpty ||
+                (currentTime - currentStateStartTime) >= BLUETOOTH_MIN_DURATION
+            
+            if !minDurationOk {
+                let remainingTime = BLUETOOTH_MIN_DURATION - (currentTime - currentStateStartTime)
+                print(String(format: "[蓝牙] 当前动作%@需继续保持%.0fms，暂不切换到%@",
+                             currentBluetoothState,
+                             remainingTime,
+                             pendingBluetoothState))
+                return
+            }
+            
+            let gapOk = (currentTime - lastBluetoothSendTime) >= BLUETOOTH_SEND_INTERVAL
+            
+            if !gapOk {
+                print(String(format: "[蓝牙] 动作切换等待发送间隔: gap=%.0fms, need=%.0fms",
+                             currentTime - lastBluetoothSendTime,
+                             BLUETOOTH_SEND_INTERVAL))
+                return
+            }
+            
+            let levelToSend: Int
+            if isSexAction(pendingBluetoothState) {
+                // 切换到 do/oral 时，携带当前已确认档位
+                levelToSend = currentLevel
+            } else {
+                // 切换到 Noise 时，档位置 0
+                levelToSend = 0
+            }
+            
+            print(String(format: "[蓝牙] [同步分析] ✅ 发送指令: action=%@, level=%d, 已稳定=%.0fms",
+                         pendingBluetoothState,
+                         levelToSend,
+                         currentTime - pendingStateStartTime))
+            
+            latestBluetoothAction = pendingBluetoothState
+            
+            if BluetoothManager.shared.isConnected {
+                BluetoothManager.shared.sendAction(pendingBluetoothState, levelToSend)
+                print("[蓝牙] [同步分析] ✅ 已通过BLE发送指令(动作切换/含档位)")
+                print("[音频节律] ✅ 发送节律：\(levelToSend)")
+            } else {
+                print("[蓝牙] BLE未连接，仅更新UI显示")
+            }
+            
+            currentBluetoothState = pendingBluetoothState
+            currentStateStartTime = currentTime
+            lastBluetoothSendTime = currentTime
+            
+            // 关键同步：
+            // 保证 currentLevel / lastSentLevel / 实际发送档位一致。
+            if isSexAction(currentBluetoothState) {
+                currentLevel = levelToSend
+                currentLevelSinceMs = currentTime
+                lastSentLevel = levelToSend
+            } else {
+                lastSentLevel = 0
+            }
+            
+            return
+        }
+        
+        
+        // ===================== 情况 B：动作未变，但档位变化 =====================
+        // 例如当前仍然是 do，但档位从 8 降到 4。
+        // 由于协议没有单独速度帧，所以重发同一动作并携带新档位。
+        let levelChanged = supportsLevel && (currentLevel != lastSentLevel)
+        let gapOk = (currentTime - lastBluetoothSendTime) >= BLUETOOTH_SEND_INTERVAL
+        
+        print(String(format: "[档位发送判断] action=%@, supportsLevel=%@, currentLevel=%d, lastSentLevel=%d, levelChanged=%@, gapOk=%@, gap=%.0fms",
+                     currentBluetoothState,
+                     supportsLevel ? "true" : "false",
+                     currentLevel,
+                     lastSentLevel,
+                     levelChanged ? "true" : "false",
+                     gapOk ? "true" : "false",
+                     currentTime - lastBluetoothSendTime))
+        
+        if levelChanged && gapOk {
+            let levelToSend = currentLevel
+            
+            print(String(format: "[蓝牙] 同动作更新档位：%@ -> level=%d",
+                         currentBluetoothState,
+                         levelToSend))
+            
+            if BluetoothManager.shared.isConnected {
+                BluetoothManager.shared.sendAction(currentBluetoothState, levelToSend)
+                print("[蓝牙] [同步分析] ✅ 已通过BLE发送指令(同动作/更新档位)")
+                print("[音频节律] ✅ 发送节律：\(levelToSend)")
+            } else {
+                print("[蓝牙] BLE未连接，无法更新档位（同动作）")
+            }
+            
+            lastSentLevel = levelToSend
+            lastBluetoothSendTime = currentTime
         }
     }
 
-    @inline(__always) private func upThreshold(_ c: Int)   -> Int { min(10, c + 1) }
-    @inline(__always) private func downThreshold(_ c: Int) -> Int { max(0,  c - 1) }
-    private func isSexAction(_ a: String) -> Bool {
-        let l = a.lowercased(); return l.hasPrefix("do") || l.hasPrefix("oral")
+    // ===================== 蓝牙更新状态的工具类函数 =====================
+
+    // 迟滞阈值
+    @inline(__always) private func upThreshold(_ cur: Int) -> Int {
+        return min(8, cur + 1)
     }
+
+    @inline(__always) private func downThreshold(_ cur: Int) -> Int {
+        return max(0, cur - 1)
+    }
+
+    // 当前动作是否属于支持变速的动作
+    private func isSexAction(_ action: String) -> Bool {
+        let lower = action.lowercased()
+        return lower.hasPrefix("do") || lower.hasPrefix("oral")
+    }
+
+    // 新版 updateBluetoothState 已不再依赖这个函数。
+    // 如果其他地方没用，可以保留，也可以删除。
     private func currentStateSupportsSpeed() -> Bool {
-        let l = currentBluetoothState.lowercased(); return l.hasPrefix("do") || l.hasPrefix("oral")
+        let lower = currentBluetoothState.lowercased()
+        return lower.hasPrefix("do") || lower.hasPrefix("oral")
     }
 }
