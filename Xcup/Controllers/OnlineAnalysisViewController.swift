@@ -174,12 +174,12 @@ class OnlineAnalysisViewController: UIViewController {
     // MARK: - UI 布局
 
     private func setupUI() {
-        view.backgroundColor = .black
+        view.backgroundColor = .md3Background
 
         // 屏幕预览（广播开始后显示）
         previewImageView.translatesAutoresizingMaskIntoConstraints = false
         previewImageView.contentMode = .scaleAspectFit
-        previewImageView.backgroundColor = .black
+        previewImageView.backgroundColor = .md3Background
         view.addSubview(previewImageView)
         NSLayoutConstraint.activate([
             previewImageView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
@@ -194,27 +194,30 @@ class OnlineAnalysisViewController: UIViewController {
         for (i, label) in labels.enumerated() {
             label.translatesAutoresizingMaskIntoConstraints = false
             label.textColor        = .white
-            label.font             = UIFont.systemFont(ofSize: 13)
+            label.font             = .systemFont(ofSize: 12, weight: .medium)
             label.text             = titles[i]
-            label.backgroundColor  = UIColor.black.withAlphaComponent(0.45)
-            label.layer.cornerRadius = 4
+            label.backgroundColor  = UIColor.black.withAlphaComponent(0.55)
+            label.layer.cornerRadius = 8
+            label.layer.cornerCurve  = .continuous
             label.clipsToBounds    = true
             view.addSubview(label)
             NSLayoutConstraint.activate([
-                label.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
+                label.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
                 label.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor,
-                                           constant: CGFloat(12 + i * 24))
+                                           constant: CGFloat(12 + i * 26))
             ])
         }
 
         // 状态标签（顶部居中）
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
-        statusLabel.textColor        = .yellow
-        statusLabel.font             = UIFont.systemFont(ofSize: 14, weight: .semibold)
+        statusLabel.textColor        = .white
+        statusLabel.font             = .systemFont(ofSize: 13, weight: .semibold)
         statusLabel.text             = ""
-        statusLabel.backgroundColor  = UIColor.black.withAlphaComponent(0.5)
-        statusLabel.layer.cornerRadius = 6
+        statusLabel.backgroundColor  = UIColor.black.withAlphaComponent(0.6)
+        statusLabel.layer.cornerRadius = 10
+        statusLabel.layer.cornerCurve  = .continuous
         statusLabel.clipsToBounds    = true
+        statusLabel.textAlignment    = .center
         view.addSubview(statusLabel)
         NSLayoutConstraint.activate([
             statusLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
@@ -242,26 +245,27 @@ class OnlineAnalysisViewController: UIViewController {
         // ── 未广播时的居中覆盖层（在诊断面板之后加入，遮住背景内容）──
         setupStartOverlay()
 
-        // 停止按钮：最后加入，z 轴最高，始终在覆盖层之上可点击
+        // 停止按钮：MD3 Error Filled stadium，z 轴最高
         btnStop.translatesAutoresizingMaskIntoConstraints = false
         btnStop.setTitle("停止", for: .normal)
-        btnStop.setTitleColor(.white, for: .normal)
-        btnStop.backgroundColor    = UIColor.systemRed.withAlphaComponent(0.85)
-        btnStop.layer.cornerRadius = 8
-        btnStop.titleLabel?.font   = UIFont.systemFont(ofSize: 15, weight: .semibold)
+        btnStop.setTitleColor(.md3OnError, for: .normal)
+        btnStop.backgroundColor    = .md3Error
+        btnStop.layer.cornerRadius = 20
+        btnStop.layer.cornerCurve  = .continuous
+        btnStop.titleLabel?.font   = .systemFont(ofSize: 15, weight: .medium)
         btnStop.addTarget(self, action: #selector(onStopTapped), for: .touchUpInside)
         view.addSubview(btnStop)
         NSLayoutConstraint.activate([
             btnStop.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
             btnStop.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 12),
-            btnStop.widthAnchor.constraint(equalToConstant: 72),
-            btnStop.heightAnchor.constraint(equalToConstant: 36)
+            btnStop.widthAnchor.constraint(equalToConstant: 80),
+            btnStop.heightAnchor.constraint(equalToConstant: 40)
         ])
     }
 
     private func setupStartOverlay() {
         startOverlay.translatesAutoresizingMaskIntoConstraints = false
-        startOverlay.backgroundColor = UIColor(white: 0.08, alpha: 1)
+        startOverlay.backgroundColor = .md3Background
         view.addSubview(startOverlay)
         NSLayoutConstraint.activate([
             startOverlay.leadingAnchor.constraint(equalTo: view.leadingAnchor),
@@ -270,26 +274,27 @@ class OnlineAnalysisViewController: UIViewController {
             startOverlay.bottomAnchor.constraint(equalTo: view.bottomAnchor)
         ])
 
-        // 图标
-        let iconLabel = UILabel()
-        iconLabel.text = ""
-        iconLabel.font = UIFont.systemFont(ofSize: 60)
-        iconLabel.textAlignment = .center
-        iconLabel.translatesAutoresizingMaskIntoConstraints = false
+        // 图标（MD3 hero icon）
+        let iconView = UIImageView()
+        iconView.image = UIImage(systemName: "dot.radiowaves.left.and.right",
+                                 withConfiguration: UIImage.SymbolConfiguration(pointSize: 56, weight: .regular))
+        iconView.tintColor = .md3Primary
+        iconView.contentMode = .scaleAspectFit
+        iconView.translatesAutoresizingMaskIntoConstraints = false
 
-        // 标题
+        // 标题（MD3 Headline Medium）
         let titleLabel = UILabel()
         titleLabel.text = "在线模式"
-        titleLabel.font = UIFont.systemFont(ofSize: 26, weight: .bold)
-        titleLabel.textColor = .white
+        titleLabel.font = .systemFont(ofSize: 28, weight: .medium)
+        titleLabel.textColor = .md3OnBackground
         titleLabel.textAlignment = .center
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
 
-        // 说明文字
+        // 说明文字（MD3 Body Medium）
         let descLabel = UILabel()
-        descLabel.text = "点击下方红色按钮，在弹出的系统对话框中选择「开始直播」即开始在线视频模式，可以返回桌面，观看在线视频。所有信息皆在本地处理，不会上传至服务器。"
-        descLabel.font = UIFont.systemFont(ofSize: 15)
-        descLabel.textColor = UIColor(white: 0.75, alpha: 1)
+        descLabel.text = "点击下方按钮，在弹出的系统对话框中选择「开始直播」即开始在线视频模式，可以返回桌面，观看在线视频。所有信息皆在本地处理，不会上传至服务器。"
+        descLabel.font = .systemFont(ofSize: 14, weight: .regular)
+        descLabel.textColor = .md3OnSurfaceVariant
         descLabel.textAlignment = .center
         descLabel.numberOfLines = 0
         descLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -308,36 +313,39 @@ class OnlineAnalysisViewController: UIViewController {
             picker.heightAnchor.constraint(equalToConstant: 1),
         ])
 
-        // ── 普通 UIButton 作为视觉按钮（完全可控，样式自由）──
+        // ── MD3 Filled Primary 按钮 ──
         let broadcastBtn = UIButton(type: .system)
         broadcastBtn.translatesAutoresizingMaskIntoConstraints = false
         broadcastBtn.setTitle("开始广播", for: .normal)
-        broadcastBtn.setTitleColor(.white, for: .normal)
-        broadcastBtn.titleLabel?.font = UIFont.systemFont(ofSize: 20, weight: .semibold)
-        broadcastBtn.backgroundColor = UIColor.systemRed
-        broadcastBtn.layer.cornerRadius = 20
+        broadcastBtn.setTitleColor(.md3OnPrimary, for: .normal)
+        broadcastBtn.titleLabel?.font = .systemFont(ofSize: 16, weight: .medium)
+        broadcastBtn.backgroundColor = .md3Primary
+        broadcastBtn.layer.cornerRadius = 28
+        broadcastBtn.layer.cornerCurve = .continuous
         broadcastBtn.layer.masksToBounds = true
         broadcastBtn.addTarget(self, action: #selector(onBroadcastButtonTapped), for: .touchUpInside)
 
-        [iconLabel, titleLabel, descLabel, broadcastBtn].forEach {
+        [iconView, titleLabel, descLabel, broadcastBtn].forEach {
             startOverlay.addSubview($0)
         }
 
         NSLayoutConstraint.activate([
-            iconLabel.centerXAnchor.constraint(equalTo: startOverlay.centerXAnchor),
-            iconLabel.centerYAnchor.constraint(equalTo: startOverlay.centerYAnchor, constant: -150),
+            iconView.centerXAnchor.constraint(equalTo: startOverlay.centerXAnchor),
+            iconView.centerYAnchor.constraint(equalTo: startOverlay.centerYAnchor, constant: -150),
+            iconView.widthAnchor.constraint(equalToConstant: 80),
+            iconView.heightAnchor.constraint(equalToConstant: 80),
 
-            titleLabel.topAnchor.constraint(equalTo: iconLabel.bottomAnchor, constant: 12),
+            titleLabel.topAnchor.constraint(equalTo: iconView.bottomAnchor, constant: 16),
             titleLabel.centerXAnchor.constraint(equalTo: startOverlay.centerXAnchor),
 
-            descLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 16),
+            descLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 12),
             descLabel.leadingAnchor.constraint(equalTo: startOverlay.leadingAnchor, constant: 32),
             descLabel.trailingAnchor.constraint(equalTo: startOverlay.trailingAnchor, constant: -32),
 
-            broadcastBtn.topAnchor.constraint(equalTo: descLabel.bottomAnchor, constant: 48),
+            broadcastBtn.topAnchor.constraint(equalTo: descLabel.bottomAnchor, constant: 40),
             broadcastBtn.centerXAnchor.constraint(equalTo: startOverlay.centerXAnchor),
             broadcastBtn.widthAnchor.constraint(equalToConstant: 220),
-            broadcastBtn.heightAnchor.constraint(equalToConstant: 64),
+            broadcastBtn.heightAnchor.constraint(equalToConstant: 56),
         ])
     }
 

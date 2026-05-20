@@ -80,7 +80,7 @@ struct MD3ErrorFilledButtonStyle: ButtonStyle {
 
     func makeBody(configuration: Configuration) -> some View {
         let bg: Color = isEnabled ? .md3Error : .md3OnSurface.opacity(0.12)
-        let fg: Color = isEnabled ? .md3OnPrimary : .md3OnSurface.opacity(0.38)
+        let fg: Color = isEnabled ? .md3OnError : .md3OnSurface.opacity(0.38)
 
         configuration.label
             .font(MD3Typography.titleMedium)
