@@ -9,29 +9,7 @@
 import SwiftUI
 
 // MARK: - Color tokens
-
-extension Color {
-    static let md3Primary              = Color("MD3Primary")
-    static let md3OnPrimary            = Color("MD3OnPrimary")
-    static let md3PrimaryContainer     = Color("MD3PrimaryContainer")
-    static let md3OnPrimaryContainer   = Color("MD3OnPrimaryContainer")
-    static let md3Secondary            = Color("MD3Secondary")
-    static let md3SecondaryContainer   = Color("MD3SecondaryContainer")
-    static let md3OnSecondaryContainer = Color("MD3OnSecondaryContainer")
-    static let md3Tertiary             = Color("MD3Tertiary")
-    static let md3TertiaryContainer    = Color("MD3TertiaryContainer")
-    static let md3OnTertiaryContainer  = Color("MD3OnTertiaryContainer")
-    static let md3Error                = Color("MD3Error")
-    static let md3ErrorContainer       = Color("MD3ErrorContainer")
-    static let md3OnErrorContainer     = Color("MD3OnErrorContainer")
-    static let md3Background           = Color("MD3Background")
-    static let md3OnBackground         = Color("MD3OnBackground")
-    static let md3Surface              = Color("MD3Surface")
-    static let md3OnSurface            = Color("MD3OnSurface")
-    static let md3SurfaceVariant       = Color("MD3SurfaceVariant")
-    static let md3OnSurfaceVariant     = Color("MD3OnSurfaceVariant")
-    static let md3Outline              = Color("MD3Outline")
-}
+// Color.md3Primary 等访问器由 Xcode 根据 Assets.xcassets 自动生成（GeneratedAssetSymbols.swift），无需手写扩展。
 
 // MARK: - Typography
 
