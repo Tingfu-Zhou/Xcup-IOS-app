@@ -139,7 +139,16 @@ class OnlineAnalysisViewController: UIViewController {
     private let SILENCE_THRESHOLD_SEC:    TimeInterval = 5.0
     private var consecutiveSilentFrames   = 0
     private let MIN_SILENT_FRAMES         = 10
-    private let AUDIO_AMPLITUDE_THRESHOLD: Float = 0.005
+
+    // VAD（子窗口 + RMS/Peak dBFS + 迟滞）
+    // samples 已是 mono Float32 / [-1,1]，dBFS 公式直接对归一化值取 20*log10
+    private let VAD_SUB_WINDOWS:       Int   = 4
+    private let VAD_ACTIVATE_RMS_DB:   Float = -55.0   // 当前"无声" → 激活阈值（较严格）
+    private let VAD_ACTIVATE_PEAK_DB:  Float = -42.0
+    private let VAD_KEEP_RMS_DB:       Float = -60.0   // 当前"有声" → 保持阈值（较宽松，避免抖动）
+    private let VAD_KEEP_PEAK_DB:      Float = -48.0
+    private let VAD_LOG_INTERVAL_MS:   Int64 = 5000
+    private var lastVadLogTimeMs:      Int64 = 0
 
     // MARK: - 生命周期
 
@@ -521,8 +530,8 @@ class OnlineAnalysisViewController: UIViewController {
 
     private func handleSilenceDetection(samples: [Float]) {
         guard !samples.isEmpty else { return }
-        let amplitude = samples.map { abs($0) }.reduce(0, +) / Float(samples.count)
-        let hasAudio  = amplitude > AUDIO_AMPLITUDE_THRESHOLD
+        let wasActive = !isAnalysisPaused
+        let hasAudio  = detectAudioActivity(samples: samples, currentlyActive: wasActive)
         if hasAudio {
             lastAudioActiveTime     = Date().timeIntervalSince1970
             consecutiveSilentFrames = 0
@@ -540,6 +549,64 @@ class OnlineAnalysisViewController: UIViewController {
                 }
             }
         }
+    }
+
+    /// 子窗口 + RMS/Peak(dBFS) + 迟滞 的 VAD（对位 Android `detectAudioActivity`）。
+    /// samples 已是单声道 Float32，归一化到 [-1, 1]。
+    private func detectAudioActivity(samples: [Float], currentlyActive: Bool) -> Bool {
+        let sampleCount = samples.count
+        if sampleCount <= 0 { return currentlyActive }
+
+        let samplesPerWindow = max(1, sampleCount / VAD_SUB_WINDOWS)
+
+        let rmsThreshold  = currentlyActive ? VAD_KEEP_RMS_DB  : VAD_ACTIVATE_RMS_DB
+        let peakThreshold = currentlyActive ? VAD_KEEP_PEAK_DB : VAD_ACTIVATE_PEAK_DB
+
+        var active = false
+        var maxRmsDb:  Float = -.infinity
+        var maxPeakDb: Float = -.infinity
+
+        samples.withUnsafeBufferPointer { ptr in
+            for w in 0..<VAD_SUB_WINDOWS {
+                let start = w * samplesPerWindow
+                let end   = (w == VAD_SUB_WINDOWS - 1) ? sampleCount : min(start + samplesPerWindow, sampleCount)
+                let subCount = end - start
+                if subCount <= 0 { continue }
+
+                var sumSquare: Double = 0
+                var peakAbs:   Float  = 0
+                for i in start..<end {
+                    let s = ptr[i]
+                    let a = abs(s)
+                    if a > peakAbs { peakAbs = a }
+                    sumSquare += Double(s) * Double(s)
+                }
+
+                let rms    = sqrt(sumSquare / Double(subCount))
+                let peak   = Double(peakAbs)
+                let rmsDb  = Float(20.0 * log10(max(rms,  1e-9)))
+                let peakDb = Float(20.0 * log10(max(peak, 1e-9)))
+
+                if rmsDb  > maxRmsDb  { maxRmsDb  = rmsDb }
+                if peakDb > maxPeakDb { maxPeakDb = peakDb }
+
+                if rmsDb > rmsThreshold || peakDb > peakThreshold {
+                    active = true
+                }
+            }
+        }
+
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        if nowMs - lastVadLogTimeMs > VAD_LOG_INTERVAL_MS {
+            lastVadLogTimeMs = nowMs
+            print(String(format: "[音频检测] maxSubRMS=%.1fdB maxSubPeak=%.1fdB -> active=%@ (state=%@, th: RMS>%.0fdB or Peak>%.0fdB)",
+                         maxRmsDb, maxPeakDb,
+                         active ? "true" : "false",
+                         currentlyActive ? "ACTIVE" : "SILENT",
+                         rmsThreshold, peakThreshold))
+        }
+
+        return active
     }
 
     // MARK: - 广播停止处理
