@@ -982,7 +982,7 @@ class OnlineAnalysisViewController: UIViewController {
         for (i, rec) in actionHistory.enumerated() {
             let w = Float(i + 1) / Float(actionHistory.count)
             if !rec.videoAction.isEmpty && rec.videoAction != "Background" {
-                scores[rec.videoAction, default: 0] += rec.videoConfidence * w * 0.8
+                scores[rec.videoAction, default: 0] += rec.videoConfidence * w * 0.7
                 counts[rec.videoAction, default: 0] += 1
             }
             if !rec.audioAction.isEmpty {
