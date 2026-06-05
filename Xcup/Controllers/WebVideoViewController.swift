@@ -1,0 +1,653 @@
+//
+//  WebVideoViewController.swift
+//  Xcup
+//
+//  网页视频模式：内置 WKWebView 浏览视频网站，嗅探视频流（.mp4 / .m3u8），
+//  用户点"开始分析"后跳转到 WebVideoAnalysisViewController 用 AVPlayer 重放 + 本地分析。
+//
+//  对应 Android: WebVideoActivity.java
+//
+//  WKWebView 几个不可少的处理（详见任务备忘）：
+//   1) WKUIDelegate.createWebViewWith → 蜜罐 WKWebView，拦截 window.open 广告弹窗
+//   2) WKNavigationDelegate.decidePolicyFor → 拦截跨站主窗口跳转
+//   3) WKContentRuleList → 屏蔽广告域名
+//   4) JS 注入（documentStart）→ monkey-patch fetch / XHR / HTMLMediaElement.src，
+//      把视频 URL + UA + Referer 通过 messageHandler 送回 native
+//   5) 起播位置：JS 读 document.querySelector('video').currentTime
+//
+
+import UIKit
+import WebKit
+import AVFoundation
+
+class WebVideoViewController: UIViewController {
+
+    // MARK: - 由 SwiftUI 包装层注入：关闭整页（fullScreenCover）
+    var onDismiss: (() -> Void)?
+
+    // MARK: - UI
+    private let urlBar = UITextField()
+    private let goButton = UIButton(type: .system)
+    private let backButton = UIButton(type: .system)
+    private let forwardButton = UIButton(type: .system)
+    private let analyzeButton = UIButton(type: .system)
+    private let closeButton = UIButton(type: .system)
+    private let statusLabel = UILabel()
+    private var webView: WKWebView!
+
+    // MARK: - 嗅探状态
+    private var sniffedVideoURL: URL?
+    private var sniffedReferer: String?
+    private var sniffedUserAgent: String?
+    private var lastPageURL: URL?
+    private var pageRootHost: String?
+
+    // 蜜罐 WebViews + 它们的代理（防止被释放）
+    private var honeypotEntries: [(view: WKWebView, delegate: HoneypotNavDelegate)] = []
+
+    // JS 轮询 <video>.src / currentTime 的 timer
+    private var jsPollTimer: Timer?
+
+    // 用户在地址栏主动输入时，下一次 navigation 跳过跨站检查
+    private var allowNextNavigation = false
+
+    // 已经标记过"嗅到了，按钮可点"的状态
+    private var hasSniffed: Bool { sniffedVideoURL != nil }
+
+    // 桌面 Chrome UA（很多视频站会按 UA 区分）
+    private let desktopUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15"
+
+    // 默认首页（可改）
+    private let defaultHomeURL = "https://www.google.com"
+
+    // 广告域名（含子域）— 与 Android 端一致
+    private let adHosts: [String] = [
+        "ero-labs.top",
+        "trafficstars.com",
+        "tsyndicate.com",
+        "juicyads.com",
+        "exoclick.com",
+        "exosrv.com",
+        "adsterra.net",
+        "adsterra.com",
+        "popads.net",
+        "revcontent.com",
+        "doubleclick.net",
+        "googlesyndication.com"
+    ]
+
+    // MARK: - 生命周期
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .black
+        setupUI()
+        setupWebView()
+        // 默认载入首页
+        if let url = URL(string: defaultHomeURL) {
+            webView.load(URLRequest(url: url))
+        }
+        startJsPollLoop()
+    }
+
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        jsPollTimer?.invalidate()
+        jsPollTimer = nil
+    }
+
+    deinit {
+        jsPollTimer?.invalidate()
+        // 移除所有 message handler 避免循环引用
+        let ucc = webView?.configuration.userContentController
+        ucc?.removeScriptMessageHandler(forName: "videoSniff")
+    }
+
+    // MARK: - UI
+
+    private func setupUI() {
+        view.backgroundColor = UIColor(white: 0.08, alpha: 1.0)
+
+        // 顶部地址栏容器
+        let topBar = UIView()
+        topBar.backgroundColor = UIColor(white: 0.12, alpha: 1.0)
+        topBar.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(topBar)
+
+        urlBar.translatesAutoresizingMaskIntoConstraints = false
+        urlBar.backgroundColor = UIColor(white: 0.22, alpha: 1.0)
+        urlBar.textColor = .white
+        urlBar.tintColor = .white
+        urlBar.font = .systemFont(ofSize: 14)
+        urlBar.placeholder = "输入网址，回车打开"
+        urlBar.attributedPlaceholder = NSAttributedString(
+            string: "输入网址，回车打开",
+            attributes: [.foregroundColor: UIColor(white: 1, alpha: 0.5)]
+        )
+        urlBar.borderStyle = .roundedRect
+        urlBar.keyboardType = .URL
+        urlBar.returnKeyType = .go
+        urlBar.autocapitalizationType = .none
+        urlBar.autocorrectionType = .no
+        urlBar.clearButtonMode = .whileEditing
+        urlBar.delegate = self
+        topBar.addSubview(urlBar)
+
+        configureBarButton(closeButton, systemName: "xmark", action: #selector(onCloseTapped))
+        configureBarButton(backButton, systemName: "chevron.backward", action: #selector(onBackTapped))
+        configureBarButton(forwardButton, systemName: "chevron.forward", action: #selector(onForwardTapped))
+        topBar.addSubview(closeButton)
+        topBar.addSubview(backButton)
+        topBar.addSubview(forwardButton)
+
+        goButton.translatesAutoresizingMaskIntoConstraints = false
+        goButton.setTitle("打开", for: .normal)
+        goButton.setTitleColor(.white, for: .normal)
+        goButton.titleLabel?.font = .systemFont(ofSize: 14, weight: .medium)
+        goButton.addTarget(self, action: #selector(onGoTapped), for: .touchUpInside)
+        topBar.addSubview(goButton)
+
+        // 状态条
+        statusLabel.translatesAutoresizingMaskIntoConstraints = false
+        statusLabel.textColor = .white
+        statusLabel.font = .systemFont(ofSize: 11)
+        statusLabel.text = "尚未嗅到视频流"
+        statusLabel.backgroundColor = UIColor.black.withAlphaComponent(0.6)
+        statusLabel.textAlignment = .center
+        view.addSubview(statusLabel)
+
+        // 开始分析按钮（底部）
+        analyzeButton.translatesAutoresizingMaskIntoConstraints = false
+        analyzeButton.setTitle("开始分析（尚未嗅到视频）", for: .normal)
+        analyzeButton.setTitleColor(.white, for: .normal)
+        analyzeButton.titleLabel?.font = .systemFont(ofSize: 16, weight: .medium)
+        analyzeButton.backgroundColor = UIColor.gray
+        analyzeButton.layer.cornerRadius = 24
+        analyzeButton.layer.masksToBounds = true
+        analyzeButton.isEnabled = false
+        analyzeButton.addTarget(self, action: #selector(onAnalyzeTapped), for: .touchUpInside)
+        view.addSubview(analyzeButton)
+
+        NSLayoutConstraint.activate([
+            topBar.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+            topBar.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            topBar.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            topBar.heightAnchor.constraint(equalToConstant: 48),
+
+            closeButton.leadingAnchor.constraint(equalTo: topBar.leadingAnchor, constant: 8),
+            closeButton.centerYAnchor.constraint(equalTo: topBar.centerYAnchor),
+            closeButton.widthAnchor.constraint(equalToConstant: 32),
+            closeButton.heightAnchor.constraint(equalToConstant: 32),
+
+            backButton.leadingAnchor.constraint(equalTo: closeButton.trailingAnchor, constant: 4),
+            backButton.centerYAnchor.constraint(equalTo: topBar.centerYAnchor),
+            backButton.widthAnchor.constraint(equalToConstant: 32),
+            backButton.heightAnchor.constraint(equalToConstant: 32),
+
+            forwardButton.leadingAnchor.constraint(equalTo: backButton.trailingAnchor, constant: 4),
+            forwardButton.centerYAnchor.constraint(equalTo: topBar.centerYAnchor),
+            forwardButton.widthAnchor.constraint(equalToConstant: 32),
+            forwardButton.heightAnchor.constraint(equalToConstant: 32),
+
+            urlBar.leadingAnchor.constraint(equalTo: forwardButton.trailingAnchor, constant: 8),
+            urlBar.trailingAnchor.constraint(equalTo: goButton.leadingAnchor, constant: -8),
+            urlBar.centerYAnchor.constraint(equalTo: topBar.centerYAnchor),
+            urlBar.heightAnchor.constraint(equalToConstant: 32),
+
+            goButton.trailingAnchor.constraint(equalTo: topBar.trailingAnchor, constant: -8),
+            goButton.centerYAnchor.constraint(equalTo: topBar.centerYAnchor),
+            goButton.widthAnchor.constraint(equalToConstant: 44),
+
+            statusLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            statusLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            statusLabel.topAnchor.constraint(equalTo: topBar.bottomAnchor),
+            statusLabel.heightAnchor.constraint(equalToConstant: 22),
+
+            analyzeButton.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            analyzeButton.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -16),
+            analyzeButton.widthAnchor.constraint(equalToConstant: 280),
+            analyzeButton.heightAnchor.constraint(equalToConstant: 48)
+        ])
+    }
+
+    private func configureBarButton(_ button: UIButton, systemName: String, action: Selector) {
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.setImage(UIImage(systemName: systemName), for: .normal)
+        button.tintColor = .white
+        button.addTarget(self, action: action, for: .touchUpInside)
+    }
+
+    // MARK: - WebView 设置
+
+    private func setupWebView() {
+        let cfg = WKWebViewConfiguration()
+        cfg.allowsInlineMediaPlayback = true
+        cfg.mediaTypesRequiringUserActionForPlayback = []  // 自动播放，便于嗅探
+
+        // 1) JS 注入：document_start 时机 monkey-patch fetch / XHR / HTMLMediaElement.src
+        let ucc = WKUserContentController()
+        let userScript = WKUserScript(
+            source: Self.sniffJSSource,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false   // 子 frame 也注入
+        )
+        ucc.addUserScript(userScript)
+        ucc.add(self, name: "videoSniff")
+        cfg.userContentController = ucc
+
+        // 2) WKContentRuleList：广告域名屏蔽
+        compileAdBlockRuleList { [weak self] list in
+            guard let self = self, let list = list else { return }
+            DispatchQueue.main.async {
+                self.webView?.configuration.userContentController.add(list)
+            }
+        }
+
+        webView = WKWebView(frame: .zero, configuration: cfg)
+        webView.translatesAutoresizingMaskIntoConstraints = false
+        webView.navigationDelegate = self
+        webView.uiDelegate = self
+        webView.allowsBackForwardNavigationGestures = true
+        webView.customUserAgent = desktopUA
+
+        view.addSubview(webView)
+        view.sendSubviewToBack(webView)
+        NSLayoutConstraint.activate([
+            webView.topAnchor.constraint(equalTo: statusLabel.bottomAnchor),
+            webView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            webView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            webView.bottomAnchor.constraint(equalTo: analyzeButton.topAnchor, constant: -8)
+        ])
+    }
+
+    // MARK: - 顶部按钮 / 地址栏
+
+    @objc private func onCloseTapped() {
+        onDismiss?()
+    }
+    @objc private func onGoTapped() {
+        loadFromUrlBar()
+    }
+    @objc private func onBackTapped() {
+        if webView.canGoBack { webView.goBack() }
+    }
+    @objc private func onForwardTapped() {
+        if webView.canGoForward { webView.goForward() }
+    }
+    private func loadFromUrlBar() {
+        urlBar.resignFirstResponder()
+        var text = (urlBar.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        if !text.lowercased().hasPrefix("http://") && !text.lowercased().hasPrefix("https://") {
+            text = "https://" + text
+        }
+        guard let url = URL(string: text) else { return }
+        allowNextNavigation = true   // 用户主动输入，跳过跨站检查
+        webView.load(URLRequest(url: url))
+    }
+
+    // MARK: - 开始分析
+
+    @objc private func onAnalyzeTapped() {
+        guard let videoURL = sniffedVideoURL else { return }
+
+        // 先取 currentTime 作为起播位置
+        webView.evaluateJavaScript("(function(){var v=document.querySelector('video');return v?v.currentTime:0;})();") { [weak self] result, _ in
+            guard let self = self else { return }
+            let startSec = (result as? Double) ?? Double((result as? NSNumber)?.doubleValue ?? 0)
+            let startMs = Int64(max(0, startSec) * 1000)
+
+            // 再拿 Cookie
+            self.collectCookies(for: videoURL) { cookies in
+                var headers: [String: String] = [:]
+                if let ua = self.sniffedUserAgent { headers["User-Agent"] = ua } else { headers["User-Agent"] = self.desktopUA }
+                if let ref = self.sniffedReferer ?? self.lastPageURL?.absoluteString { headers["Referer"] = ref }
+                if !cookies.isEmpty { headers["Cookie"] = cookies }
+
+                self.presentAnalysisVC(videoURL: videoURL, headers: headers, startMs: startMs)
+            }
+        }
+    }
+
+    private func presentAnalysisVC(videoURL: URL, headers: [String: String], startMs: Int64) {
+        let vc = WebVideoAnalysisViewController()
+        vc.videoURL = videoURL
+        vc.requestHeaders = headers
+        vc.startMs = startMs
+        vc.modalPresentationStyle = .fullScreen
+        present(vc, animated: true)
+    }
+
+    // MARK: - Cookie 收集（按 host 过滤）
+
+    private func collectCookies(for url: URL, completion: @escaping (String) -> Void) {
+        guard let host = url.host else { completion(""); return }
+        let store = webView.configuration.websiteDataStore.httpCookieStore
+        store.getAllCookies { cookies in
+            let pairs = cookies
+                .filter { Self.cookieMatchesHost($0, host: host) }
+                .map { "\($0.name)=\($0.value)" }
+            completion(pairs.joined(separator: "; "))
+        }
+    }
+
+    private static func cookieMatchesHost(_ c: HTTPCookie, host: String) -> Bool {
+        // 简化匹配：cookie.domain 是 host 后缀
+        var d = c.domain
+        if d.hasPrefix(".") { d.removeFirst() }
+        return host == d || host.hasSuffix("." + d)
+    }
+
+    // MARK: - 嗅探入口（来自 JS / shouldStartLoad / JS poll）
+
+    private func handleSniffedURL(_ urlString: String, source: String, ua: String? = nil, referer: String? = nil) {
+        guard sniffedVideoURL == nil else { return }
+        guard isLikelyVideoURL(urlString) else { return }
+        guard let url = URL(string: urlString) else { return }
+        sniffedVideoURL = url
+        if let ua = ua, !ua.isEmpty { sniffedUserAgent = ua }
+        if let r = referer, !r.isEmpty { sniffedReferer = r }
+        if sniffedReferer == nil { sniffedReferer = lastPageURL?.absoluteString }
+        if sniffedUserAgent == nil { sniffedUserAgent = desktopUA }
+
+        DispatchQueue.main.async {
+            self.statusLabel.text = "已嗅到视频流（\(source)）"
+            self.analyzeButton.isEnabled = true
+            self.analyzeButton.backgroundColor = UIColor.systemBlue
+            self.analyzeButton.setTitle("开始分析", for: .normal)
+        }
+        print("✅ [WebVideo] 嗅到: \(urlString)  src=\(source)")
+    }
+
+    private func isLikelyVideoURL(_ s: String) -> Bool {
+        let lower = s.lowercased()
+        // 文件后缀
+        if lower.contains(".m3u8") || lower.contains(".m3u?") { return true }
+        if lower.hasSuffix(".mp4") || lower.contains(".mp4?") { return true }
+        if lower.hasSuffix(".m3u8") { return true }
+        // blob: 跳过（MSE/HLS）
+        if lower.hasPrefix("blob:") { return false }
+        return false
+    }
+
+    // MARK: - JS 轮询（拿 <video>.src + currentTime）
+
+    private func startJsPollLoop() {
+        jsPollTimer?.invalidate()
+        jsPollTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            self?.pollVideoSrc()
+        }
+    }
+
+    private func pollVideoSrc() {
+        guard !hasSniffed, webView != nil else { return }
+        let js = "(function(){var v=document.querySelector('video');return v?(v.src||v.currentSrc||''):'';})();"
+        webView.evaluateJavaScript(js) { [weak self] result, _ in
+            guard let self = self else { return }
+            guard let s = result as? String, !s.isEmpty else { return }
+            self.handleSniffedURL(s, source: "JS轮询")
+        }
+    }
+
+    // MARK: - 重置嗅探状态
+
+    private func resetSniffState(pageURL: URL?) {
+        sniffedVideoURL = nil
+        sniffedReferer = nil
+        sniffedUserAgent = nil
+        lastPageURL = pageURL
+        pageRootHost = pageURL.flatMap { Self.extractRootDomain($0.host) }
+        DispatchQueue.main.async {
+            self.statusLabel.text = "尚未嗅到视频流"
+            self.analyzeButton.isEnabled = false
+            self.analyzeButton.backgroundColor = UIColor.gray
+            self.analyzeButton.setTitle("开始分析（尚未嗅到视频）", for: .normal)
+        }
+    }
+
+    // host = "www.missav.ws" → "missav.ws"
+    private static func extractRootDomain(_ host: String?) -> String? {
+        guard let host = host else { return nil }
+        let parts = host.split(separator: ".")
+        if parts.count <= 2 { return host }
+        return parts.suffix(2).joined(separator: ".")
+    }
+
+    // MARK: - WKContentRuleList 编译（广告域名屏蔽）
+
+    private func compileAdBlockRuleList(completion: @escaping (WKContentRuleList?) -> Void) {
+        var rules: [[String: Any]] = []
+        for host in adHosts {
+            let esc = NSRegularExpression.escapedPattern(for: host)
+            rules.append([
+                "trigger": ["url-filter": ".*" + esc + ".*"],
+                "action": ["type": "block"]
+            ])
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: rules),
+              let json = String(data: data, encoding: .utf8) else {
+            completion(nil); return
+        }
+        WKContentRuleListStore.default()?.compileContentRuleList(
+            forIdentifier: "XcupAdBlockRules",
+            encodedContentRuleList: json
+        ) { list, err in
+            if let err = err {
+                print("⚠️ [WebVideo] AdBlock RuleList 编译失败: \(err)")
+            }
+            completion(list)
+        }
+    }
+
+    // MARK: - JS 源（嗅探 fetch / XHR / video.src）
+
+    private static let sniffJSSource: String = """
+    (function(){
+      if (window.__xcupSniffInstalled) return;
+      window.__xcupSniffInstalled = true;
+      var send = function(payload){
+        try { window.webkit.messageHandlers.videoSniff.postMessage(payload); } catch(e){}
+      };
+      var looksVideo = function(u){
+        if (!u || typeof u !== 'string') return false;
+        if (u.indexOf('blob:') === 0) return false;
+        var lower = u.toLowerCase();
+        return lower.indexOf('.m3u8') >= 0 || lower.indexOf('.mp4') >= 0 || lower.indexOf('.m3u?') >= 0;
+      };
+
+      // 1) fetch
+      var origFetch = window.fetch;
+      if (origFetch) {
+        window.fetch = function(input, init){
+          try {
+            var u = (typeof input === 'string') ? input : (input && input.url);
+            if (looksVideo(u)) {
+              send({src: 'fetch', url: u, ua: navigator.userAgent, referer: location.href});
+            }
+          } catch(e){}
+          return origFetch.apply(this, arguments);
+        };
+      }
+
+      // 2) XHR
+      var XOpen = XMLHttpRequest.prototype.open;
+      XMLHttpRequest.prototype.open = function(method, url){
+        try {
+          if (looksVideo(url)) {
+            send({src: 'xhr', url: url, ua: navigator.userAgent, referer: location.href});
+          }
+        } catch(e){}
+        return XOpen.apply(this, arguments);
+      };
+
+      // 3) HTMLMediaElement.src setter
+      try {
+        var proto = HTMLMediaElement.prototype;
+        var desc = Object.getOwnPropertyDescriptor(proto, 'src') ||
+                   Object.getOwnPropertyDescriptor(HTMLVideoElement.prototype, 'src');
+        if (desc && desc.set) {
+          var origSet = desc.set;
+          Object.defineProperty(proto, 'src', {
+            set: function(v) {
+              try {
+                if (looksVideo(v)) {
+                  send({src: 'media-src', url: v, ua: navigator.userAgent, referer: location.href});
+                }
+              } catch(e){}
+              return origSet.call(this, v);
+            },
+            get: desc.get
+          });
+        }
+      } catch(e){}
+
+      // 4) 兜底：document_end 后扫描一次所有 <video>
+      var scan = function(){
+        try {
+          var vs = document.querySelectorAll('video');
+          vs.forEach(function(v){
+            var u = v.currentSrc || v.src || '';
+            if (looksVideo(u)) {
+              send({src: 'dom-scan', url: u, ua: navigator.userAgent, referer: location.href});
+            }
+          });
+        } catch(e){}
+      };
+      if (document.readyState === 'complete' || document.readyState === 'interactive') {
+        setTimeout(scan, 500);
+      } else {
+        document.addEventListener('DOMContentLoaded', function(){ setTimeout(scan, 500); });
+      }
+    })();
+    """
+}
+
+// MARK: - WKScriptMessageHandler
+
+extension WebVideoViewController: WKScriptMessageHandler {
+    func userContentController(_ userContentController: WKUserContentController,
+                                didReceive message: WKScriptMessage) {
+        guard message.name == "videoSniff",
+              let dict = message.body as? [String: Any] else { return }
+        let url = dict["url"] as? String ?? ""
+        let src = dict["src"] as? String ?? "?"
+        let ua = dict["ua"] as? String
+        let ref = dict["referer"] as? String
+        if !url.isEmpty {
+            handleSniffedURL(url, source: src, ua: ua, referer: ref)
+        }
+    }
+}
+
+// MARK: - WKNavigationDelegate
+
+extension WebVideoViewController: WKNavigationDelegate {
+
+    // 拦跨站主窗口跳转 + 拦广告域 + 主动嗅 .mp4 / .m3u8
+    func webView(_ webView: WKWebView,
+                  decidePolicyFor navigationAction: WKNavigationAction,
+                  decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        guard let url = navigationAction.request.url else { decisionHandler(.allow); return }
+
+        // 广告域名拦截（保险层，与 RuleList 互为兜底）
+        if let host = url.host?.lowercased() {
+            for ad in adHosts {
+                if host == ad || host.hasSuffix("." + ad) {
+                    decisionHandler(.cancel); return
+                }
+            }
+        }
+
+        // 嗅探：URL 直接看起来像视频流
+        if isLikelyVideoURL(url.absoluteString) {
+            handleSniffedURL(url.absoluteString, source: "navAction")
+            // 视频流别让 WebView 自己去打开（避免变成下载页 / 直接播放）
+            decisionHandler(.cancel)
+            return
+        }
+
+        // 仅主窗口跨站时拦（但用户在 URL bar 主动跳转的情况下放行）
+        if allowNextNavigation {
+            allowNextNavigation = false
+        } else if navigationAction.targetFrame?.isMainFrame == true,
+                  let reqHost = url.host?.lowercased(),
+                  let pageRoot = pageRootHost?.lowercased(),
+                  !pageRoot.isEmpty,
+                  !reqHost.hasSuffix(pageRoot) {
+            // 自动跳转才拦：点击链接 / location.href = X / window.open（已被 UIDelegate 拦走）
+            if navigationAction.navigationType == .other ||
+               navigationAction.navigationType == .linkActivated {
+                print("[WebVideo] 拦截跨站主窗口跳转: \(url) (page root=\(pageRoot))")
+                decisionHandler(.cancel)
+                return
+            }
+        }
+
+        decisionHandler(.allow)
+    }
+
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        if let url = webView.url, navigation != nil {
+            resetSniffState(pageURL: url)
+            DispatchQueue.main.async {
+                self.urlBar.text = url.absoluteString
+            }
+        }
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        if let url = webView.url {
+            lastPageURL = url
+            if pageRootHost == nil { pageRootHost = Self.extractRootDomain(url.host) }
+        }
+    }
+}
+
+// MARK: - WKUIDelegate（蜜罐 popup）
+
+extension WebVideoViewController: WKUIDelegate {
+
+    func webView(_ webView: WKWebView,
+                  createWebViewWith configuration: WKWebViewConfiguration,
+                  for navigationAction: WKNavigationAction,
+                  windowFeatures: WKWindowFeatures) -> WKWebView? {
+        // 蜜罐：任何 window.open / target=_blank 弹出都给一个隔离 WebView，立即拦截其所有跳转
+        let popup = WKWebView(frame: .zero, configuration: configuration)
+        let honeypot = HoneypotNavDelegate()
+        popup.navigationDelegate = honeypot
+        honeypotEntries.append((popup, honeypot))
+
+        // 1 秒后移除引用 — 避免无限累积
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self, weak popup] in
+            guard let self = self, let popup = popup else { return }
+            self.honeypotEntries.removeAll { $0.view === popup }
+        }
+        return popup
+    }
+
+    // 屏蔽 JS alert / confirm / prompt 弹窗（防止广告卡死）
+    func webView(_ webView: WKWebView,
+                  runJavaScriptAlertPanelWithMessage message: String,
+                  initiatedByFrame frame: WKFrameInfo,
+                  completionHandler: @escaping () -> Void) {
+        completionHandler()
+    }
+}
+
+// 蜜罐 popup 的导航代理 — 拦截一切跳转
+private final class HoneypotNavDelegate: NSObject, WKNavigationDelegate {
+    func webView(_ webView: WKWebView,
+                  decidePolicyFor navigationAction: WKNavigationAction,
+                  decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        decisionHandler(.cancel)
+    }
+}
+
+// MARK: - UITextFieldDelegate
+
+extension WebVideoViewController: UITextFieldDelegate {
+    func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+        loadFromUrlBar()
+        return true
+    }
+}

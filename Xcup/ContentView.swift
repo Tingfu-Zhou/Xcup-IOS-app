@@ -21,6 +21,7 @@ struct ContentView: View {
     @State private var selectedVideoURL: URL?
     @State private var showVideoProcessView = false
     @State private var showOnlineAnalysis   = false   // [新增] 在线模式开关
+    @State private var showWebVideo         = false   // [新增] 网页视频模式开关
     // [已删除] @State private var showBluetoothView = false
     @State private var isLoadingVideo = false
     @State private var errorMessage: String?
@@ -111,6 +112,18 @@ struct ContentView: View {
                         .buttonStyle(MD3FilledButtonStyle())
                         .fullScreenCover(isPresented: $showOnlineAnalysis) {
                             OnlineAnalysisView()
+                                .ignoresSafeArea()
+                        }
+
+                        // [新增] 网页视频模式（内置 WebView，嗅探视频流，AVPlayer 重放分析）
+                        Button(action: {
+                            showWebVideo = true
+                        }) {
+                            Label("网页视频模式", systemImage: "safari")
+                        }
+                        .buttonStyle(MD3FilledButtonStyle())
+                        .fullScreenCover(isPresented: $showWebVideo) {
+                            WebVideoView(isPresented: $showWebVideo)
                                 .ignoresSafeArea()
                         }
 
