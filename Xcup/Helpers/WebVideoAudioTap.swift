@@ -28,7 +28,7 @@ final class WebVideoAudioTap {
 
     // MARK: - Private
     private weak var pcmBuffer: PcmCircularBuffer?
-    private var tap: Unmanaged<MTAudioProcessingTap>?
+    private var tap: MTAudioProcessingTap?
 
     // tap 内部状态（仅在 audio thread 访问）
     fileprivate var sourceSampleRate: Double = 16000
@@ -59,7 +59,7 @@ final class WebVideoAudioTap {
             process: webvideo_tap_process
         )
 
-        var tapRef: Unmanaged<MTAudioProcessingTap>?
+        var tapRef: MTAudioProcessingTap?
         let status = MTAudioProcessingTapCreate(
             kCFAllocatorDefault,
             &callbacks,
@@ -73,7 +73,7 @@ final class WebVideoAudioTap {
         self.tap = createdTap
 
         let params = AVMutableAudioMixInputParameters(track: audioTrack)
-        params.audioTapProcessor = createdTap.takeUnretainedValue()
+        params.audioTapProcessor = createdTap
 
         let mix = AVMutableAudioMix()
         mix.inputParameters = [params]
