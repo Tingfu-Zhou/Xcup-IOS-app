@@ -57,8 +57,8 @@ class WebVideoViewController: UIViewController {
     // 桌面 Chrome UA（很多视频站会按 UA 区分）
     private let desktopUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15"
 
-    // 默认首页（可改）
-    private let defaultHomeURL = "https://www.google.com"
+    // 空状态提示视图（未加载任何页面时显示在 WebView 区域）
+    private let emptyHintView = UIView()
 
     // 广告域名（含子域）— 与 Android 端一致
     private let adHosts: [String] = [
@@ -83,10 +83,7 @@ class WebVideoViewController: UIViewController {
         view.backgroundColor = .black
         setupUI()
         setupWebView()
-        // 默认载入首页
-        if let url = URL(string: defaultHomeURL) {
-            webView.load(URLRequest(url: url))
-        }
+        setupEmptyHint()
         startJsPollLoop()
     }
 
@@ -119,9 +116,8 @@ class WebVideoViewController: UIViewController {
         urlBar.textColor = .white
         urlBar.tintColor = .white
         urlBar.font = .systemFont(ofSize: 14)
-        urlBar.placeholder = "输入网址，回车打开"
         urlBar.attributedPlaceholder = NSAttributedString(
-            string: "输入网址，回车打开",
+            string: "粘贴视频网页链接 (https://...)",
             attributes: [.foregroundColor: UIColor(white: 1, alpha: 0.5)]
         )
         urlBar.borderStyle = .roundedRect
@@ -258,6 +254,61 @@ class WebVideoViewController: UIViewController {
             webView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             webView.bottomAnchor.constraint(equalTo: analyzeButton.topAnchor, constant: -8)
         ])
+    }
+
+    // MARK: - 空状态提示
+
+    private func setupEmptyHint() {
+        emptyHintView.translatesAutoresizingMaskIntoConstraints = false
+        emptyHintView.backgroundColor = UIColor(white: 0.08, alpha: 1.0)
+        view.addSubview(emptyHintView)
+        view.bringSubviewToFront(emptyHintView)
+
+        let icon = UIImageView(image: UIImage(systemName: "link.badge.plus",
+            withConfiguration: UIImage.SymbolConfiguration(pointSize: 48, weight: .regular)))
+        icon.tintColor = UIColor(white: 1, alpha: 0.55)
+        icon.contentMode = .scaleAspectFit
+        icon.translatesAutoresizingMaskIntoConstraints = false
+
+        let title = UILabel()
+        title.text = "尚未打开任何网页"
+        title.font = .systemFont(ofSize: 17, weight: .medium)
+        title.textColor = UIColor(white: 1, alpha: 0.9)
+        title.textAlignment = .center
+        title.translatesAutoresizingMaskIntoConstraints = false
+
+        let desc = UILabel()
+        desc.text = "请在上方地址栏粘贴或输入视频网页链接（https://…），\n按回车或点击「打开」开始浏览。"
+        desc.font = .systemFont(ofSize: 13, weight: .regular)
+        desc.textColor = UIColor(white: 1, alpha: 0.6)
+        desc.textAlignment = .center
+        desc.numberOfLines = 0
+        desc.translatesAutoresizingMaskIntoConstraints = false
+
+        [icon, title, desc].forEach { emptyHintView.addSubview($0) }
+
+        NSLayoutConstraint.activate([
+            emptyHintView.topAnchor.constraint(equalTo: statusLabel.bottomAnchor),
+            emptyHintView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            emptyHintView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            emptyHintView.bottomAnchor.constraint(equalTo: analyzeButton.topAnchor, constant: -8),
+
+            icon.centerXAnchor.constraint(equalTo: emptyHintView.centerXAnchor),
+            icon.centerYAnchor.constraint(equalTo: emptyHintView.centerYAnchor, constant: -36),
+            icon.widthAnchor.constraint(equalToConstant: 64),
+            icon.heightAnchor.constraint(equalToConstant: 64),
+
+            title.topAnchor.constraint(equalTo: icon.bottomAnchor, constant: 12),
+            title.centerXAnchor.constraint(equalTo: emptyHintView.centerXAnchor),
+
+            desc.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 8),
+            desc.leadingAnchor.constraint(equalTo: emptyHintView.leadingAnchor, constant: 24),
+            desc.trailingAnchor.constraint(equalTo: emptyHintView.trailingAnchor, constant: -24),
+        ])
+    }
+
+    private func setEmptyHintVisible(_ visible: Bool) {
+        emptyHintView.isHidden = !visible
     }
 
     // MARK: - 顶部按钮 / 地址栏
@@ -591,6 +642,7 @@ extension WebVideoViewController: WKNavigationDelegate {
             resetSniffState(pageURL: url)
             DispatchQueue.main.async {
                 self.urlBar.text = url.absoluteString
+                self.setEmptyHintVisible(false)
             }
         }
     }

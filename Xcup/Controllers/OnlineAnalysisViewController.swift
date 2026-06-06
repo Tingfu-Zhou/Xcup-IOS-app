@@ -283,31 +283,6 @@ class OnlineAnalysisViewController: UIViewController {
             startOverlay.bottomAnchor.constraint(equalTo: view.bottomAnchor)
         ])
 
-        // 图标（MD3 hero icon）
-        let iconView = UIImageView()
-        iconView.image = UIImage(systemName: "dot.radiowaves.left.and.right",
-                                 withConfiguration: UIImage.SymbolConfiguration(pointSize: 56, weight: .regular))
-        iconView.tintColor = .md3Primary
-        iconView.contentMode = .scaleAspectFit
-        iconView.translatesAutoresizingMaskIntoConstraints = false
-
-        // 标题（MD3 Headline Medium）
-        let titleLabel = UILabel()
-        titleLabel.text = "在线模式"
-        titleLabel.font = .systemFont(ofSize: 28, weight: .medium)
-        titleLabel.textColor = .md3OnBackground
-        titleLabel.textAlignment = .center
-        titleLabel.translatesAutoresizingMaskIntoConstraints = false
-
-        // 说明文字（MD3 Body Medium）
-        let descLabel = UILabel()
-        descLabel.text = "点击下方按钮，在弹出的系统对话框中选择「开始直播」即开始在线视频模式，可以返回桌面，观看在线视频。所有信息皆在本地处理，不会上传至服务器。"
-        descLabel.font = .systemFont(ofSize: 14, weight: .regular)
-        descLabel.textColor = .md3OnSurfaceVariant
-        descLabel.textAlignment = .center
-        descLabel.numberOfLines = 0
-        descLabel.translatesAutoresizingMaskIntoConstraints = false
-
         // ── 隐藏的系统 Picker（1×1，藏在角落，仅用于通过代码触发系统广播对话框）──
         let picker = RPSystemBroadcastPickerView(frame: CGRect(x: 0, y: 0, width: 1, height: 1))
         picker.preferredExtension = "com.aibei.Xcup.XcupBroadcast"
@@ -322,6 +297,74 @@ class OnlineAnalysisViewController: UIViewController {
             picker.heightAnchor.constraint(equalToConstant: 1),
         ])
 
+        // ── 滚动容器 + 垂直 stack（保证小屏可滚动）──
+        let scrollView = UIScrollView()
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.alwaysBounceVertical = true
+        scrollView.showsVerticalScrollIndicator = false
+        startOverlay.addSubview(scrollView)
+
+        let stack = UIStackView()
+        stack.axis = .vertical
+        stack.alignment = .fill
+        stack.spacing = 16
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.addSubview(stack)
+
+        NSLayoutConstraint.activate([
+            scrollView.leadingAnchor.constraint(equalTo: startOverlay.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: startOverlay.trailingAnchor),
+            scrollView.topAnchor.constraint(equalTo: startOverlay.safeAreaLayoutGuide.topAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: startOverlay.safeAreaLayoutGuide.bottomAnchor),
+
+            stack.topAnchor.constraint(equalTo: scrollView.contentLayoutGuide.topAnchor, constant: 24),
+            stack.bottomAnchor.constraint(equalTo: scrollView.contentLayoutGuide.bottomAnchor, constant: -24),
+            stack.leadingAnchor.constraint(equalTo: scrollView.frameLayoutGuide.leadingAnchor, constant: 24),
+            stack.trailingAnchor.constraint(equalTo: scrollView.frameLayoutGuide.trailingAnchor, constant: -24),
+        ])
+
+        // ── Hero 区域：图标 + 标题 + 说明 ──
+        let iconView = UIImageView()
+        iconView.image = UIImage(systemName: "dot.radiowaves.left.and.right",
+                                 withConfiguration: UIImage.SymbolConfiguration(pointSize: 56, weight: .regular))
+        iconView.tintColor = .md3Primary
+        iconView.contentMode = .scaleAspectFit
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+        iconView.heightAnchor.constraint(equalToConstant: 80).isActive = true
+
+        let titleLabel = UILabel()
+        titleLabel.text = "在线模式"
+        titleLabel.font = .systemFont(ofSize: 28, weight: .medium)
+        titleLabel.textColor = .md3OnBackground
+        titleLabel.textAlignment = .center
+
+        let descLabel = UILabel()
+        descLabel.text = "点击下方按钮，在弹出的系统对话框中选择「开始直播」即开始在线视频模式，可以返回桌面，观看在线视频。所有信息皆在本地处理，不会上传至服务器。"
+        descLabel.font = .systemFont(ofSize: 14, weight: .regular)
+        descLabel.textColor = .md3OnSurfaceVariant
+        descLabel.textAlignment = .center
+        descLabel.numberOfLines = 0
+
+        // ── 三个 MD3 风格提示卡片 ──
+        let tipCard1 = makeTipCard(
+            iconName: "rectangle.landscape.rotate",
+            tint: .md3Primary,
+            title: "推荐观看方式",
+            body: "建议将手机横屏并全屏播放视频，识别效果最佳。"
+        )
+        let tipCard2 = makeTipCard(
+            iconName: "exclamationmark.shield",
+            tint: .md3Tertiary,
+            title: "温馨提示",
+            body: "部分浏览器（如 Chrome、Firefox）出于安全考虑，会自动将屏幕共享中的视频画面遮黑，并显示「为了安全起见，屏幕共享画面已隐藏此应用的内容」等提示。为了保证分析的准确性，录屏模式建议使用对应视频网站的官方 App 直接观看视频（部分 App 会禁止屏幕/音频抓取）。"
+        )
+        let tipCard3 = makeTipCard(
+            iconName: "stop.circle",
+            tint: .md3Error,
+            title: "退出在线分析",
+            body: "如需退出在线分析，可点击屏幕上方通知栏「直播屏幕」，并点击停止按钮。"
+        )
+
         // ── MD3 Filled Primary 按钮 ──
         let broadcastBtn = UIButton(type: .system)
         broadcastBtn.translatesAutoresizingMaskIntoConstraints = false
@@ -332,30 +375,84 @@ class OnlineAnalysisViewController: UIViewController {
         broadcastBtn.layer.cornerRadius = 28
         broadcastBtn.layer.cornerCurve = .continuous
         broadcastBtn.layer.masksToBounds = true
+        broadcastBtn.heightAnchor.constraint(equalToConstant: 56).isActive = true
         broadcastBtn.addTarget(self, action: #selector(onBroadcastButtonTapped), for: .touchUpInside)
 
-        [iconView, titleLabel, descLabel, broadcastBtn].forEach {
-            startOverlay.addSubview($0)
-        }
+        // 包一层等宽外框，让按钮居中且固定宽度（视觉与原版一致）
+        let buttonContainer = UIView()
+        buttonContainer.translatesAutoresizingMaskIntoConstraints = false
+        buttonContainer.addSubview(broadcastBtn)
+        NSLayoutConstraint.activate([
+            broadcastBtn.centerXAnchor.constraint(equalTo: buttonContainer.centerXAnchor),
+            broadcastBtn.topAnchor.constraint(equalTo: buttonContainer.topAnchor),
+            broadcastBtn.bottomAnchor.constraint(equalTo: buttonContainer.bottomAnchor),
+            broadcastBtn.widthAnchor.constraint(equalToConstant: 220),
+        ])
+
+        // 装配 stack
+        stack.addArrangedSubview(iconView)
+        stack.addArrangedSubview(titleLabel)
+        stack.addArrangedSubview(descLabel)
+        stack.setCustomSpacing(8, after: iconView)
+        stack.setCustomSpacing(12, after: titleLabel)
+        stack.setCustomSpacing(24, after: descLabel)
+        stack.addArrangedSubview(tipCard1)
+        stack.addArrangedSubview(tipCard2)
+        stack.addArrangedSubview(tipCard3)
+        stack.setCustomSpacing(28, after: tipCard3)
+        stack.addArrangedSubview(buttonContainer)
+    }
+
+    /// 生成一个 MD3 风格的提示卡片：圆角填充 SurfaceVariant，左上 icon + 加粗标题，下方正文。
+    private func makeTipCard(iconName: String, tint: UIColor, title: String, body: String) -> UIView {
+        let card = UIView()
+        card.backgroundColor = .md3SurfaceVariant
+        card.layer.cornerRadius = 16
+        card.layer.cornerCurve = .continuous
+        card.translatesAutoresizingMaskIntoConstraints = false
+
+        let icon = UIImageView()
+        icon.image = UIImage(systemName: iconName,
+            withConfiguration: UIImage.SymbolConfiguration(pointSize: 20, weight: .semibold))
+        icon.tintColor = tint
+        icon.contentMode = .scaleAspectFit
+        icon.translatesAutoresizingMaskIntoConstraints = false
+
+        let titleLabel = UILabel()
+        titleLabel.text = title
+        titleLabel.font = .systemFont(ofSize: 15, weight: .semibold)
+        titleLabel.textColor = .md3OnSurface
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+        titleLabel.setContentHuggingPriority(.required, for: .horizontal)
+
+        let bodyLabel = UILabel()
+        bodyLabel.text = body
+        bodyLabel.font = .systemFont(ofSize: 13, weight: .regular)
+        bodyLabel.textColor = .md3OnSurfaceVariant
+        bodyLabel.numberOfLines = 0
+        bodyLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        card.addSubview(icon)
+        card.addSubview(titleLabel)
+        card.addSubview(bodyLabel)
 
         NSLayoutConstraint.activate([
-            iconView.centerXAnchor.constraint(equalTo: startOverlay.centerXAnchor),
-            iconView.centerYAnchor.constraint(equalTo: startOverlay.centerYAnchor, constant: -150),
-            iconView.widthAnchor.constraint(equalToConstant: 80),
-            iconView.heightAnchor.constraint(equalToConstant: 80),
+            icon.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 16),
+            icon.topAnchor.constraint(equalTo: card.topAnchor, constant: 16),
+            icon.widthAnchor.constraint(equalToConstant: 22),
+            icon.heightAnchor.constraint(equalToConstant: 22),
 
-            titleLabel.topAnchor.constraint(equalTo: iconView.bottomAnchor, constant: 16),
-            titleLabel.centerXAnchor.constraint(equalTo: startOverlay.centerXAnchor),
+            titleLabel.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 10),
+            titleLabel.centerYAnchor.constraint(equalTo: icon.centerYAnchor),
+            titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: card.trailingAnchor, constant: -16),
 
-            descLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 12),
-            descLabel.leadingAnchor.constraint(equalTo: startOverlay.leadingAnchor, constant: 32),
-            descLabel.trailingAnchor.constraint(equalTo: startOverlay.trailingAnchor, constant: -32),
-
-            broadcastBtn.topAnchor.constraint(equalTo: descLabel.bottomAnchor, constant: 40),
-            broadcastBtn.centerXAnchor.constraint(equalTo: startOverlay.centerXAnchor),
-            broadcastBtn.widthAnchor.constraint(equalToConstant: 220),
-            broadcastBtn.heightAnchor.constraint(equalToConstant: 56),
+            bodyLabel.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 16),
+            bodyLabel.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -16),
+            bodyLabel.topAnchor.constraint(equalTo: icon.bottomAnchor, constant: 10),
+            bodyLabel.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -16),
         ])
+
+        return card
     }
 
     // 点击红色按钮 → 找到 picker 内部的系统按钮并程序化触发，弹出系统广播选择对话框
