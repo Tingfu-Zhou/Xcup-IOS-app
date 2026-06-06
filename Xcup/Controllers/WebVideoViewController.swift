@@ -42,6 +42,14 @@ class WebVideoViewController: UIViewController {
     private var lastPageURL: URL?
     private var pageRootHost: String?
 
+    // 评分覆盖判定：相同分数不允许互相覆盖（"真视频先到先得"）。
+    // 同一个 <video> 元素的 src 变化（typical: 广告→真视频）走 sameElement 特例，
+    // 不受 score 比较约束。
+    // 网络层 / 元素层捕获兜底分 = 1；后面如需引入更强的来源分（manifest > variant 等）
+    // 直接调整 scoreForSource() 即可。
+    private var currentBestElementId: String?
+    private var currentBestScore: Int = 0
+
     // 蜜罐 WebViews + 它们的代理（防止被释放）
     private var honeypotEntries: [(view: WKWebView, delegate: HoneypotNavDelegate)] = []
 
@@ -390,15 +398,22 @@ class WebVideoViewController: UIViewController {
 
     // MARK: - 嗅探入口（来自 JS / shouldStartLoad / JS poll）
     //
-    // 策略：**持续更新到最新**（不再 first-match-wins）。
-    // 因为 Pornhub 这类站会先预拉 trickplay 缩略图条 + 广告流，真视频后到。
-    // 锁定第一个嗅到的会被预览/广告劫持，分析页只能播几秒。
-    //   1) looksLikeVideoURL：严格后缀 + 黑名单（.ts/.m4s/.m4a/.aac/.vtt 排除）
+    // 覆盖判定规则（"真视频先到先得"）：
+    //   1) looksLikeVideoURL：严格后缀白名单 + 分片/字幕黑名单 + fMP4 分片识别
     //   2) looksLikePreviewUrl：trickplay / sprite / 缩略图条排除
-    //   3) 同 URL 去重（避免重复刷 UI / 打日志）
-    //   4) 通过的覆盖到 sniffedVideoURL，UI 显示"已嗅到视频流（来源，最新覆盖）"
+    //   3) 同 URL 去重（不刷 UI 也不打日志）
+    //   4) **核心**：
+    //        - 首次 → 接受
+    //        - elementId == currentBestElementId （同 <video> 元素 src 变化）→ 接受
+    //          （典型例：Pornhub 主播放器从广告 src 切到真视频 src）
+    //        - score > currentBestScore（严格大于！）→ 接受
+    //        - 其它 → 拒绝（同分不允许互相覆盖，防止 missav 推荐位顶掉真视频）
 
-    private func handleSniffedURL(_ urlString: String, source: String, ua: String? = nil, referer: String? = nil) {
+    private func handleSniffedURL(_ urlString: String,
+                                  source: String,
+                                  ua: String? = nil,
+                                  referer: String? = nil,
+                                  elementId: String? = nil) {
         // 第一道：是不是"看起来可播放的视频" URL
         guard isLikelyVideoURL(urlString) else { return }
         // 第二道：是不是 trickplay / 预览 / 缩略图条
@@ -408,21 +423,48 @@ class WebVideoViewController: UIViewController {
         }
         // 同 URL 去重：不刷 UI 也不打日志
         if let cur = sniffedVideoURL, cur.absoluteString == urlString { return }
+
+        // 兜底来源分；后续要引入更强的来源分（manifest > variant > network）改这里
+        let score = scoreForSource(source)
+
+        // 覆盖判定
+        let acceptReason: String
+        if sniffedVideoURL == nil {
+            acceptReason = "first"
+        } else if let eid = elementId, !eid.isEmpty, eid == currentBestElementId {
+            // 同元素 src 变化：典型 Pornhub 广告→真视频，绕过 score 比较
+            acceptReason = "sameElement(\(eid))"
+        } else if score > currentBestScore {
+            // 严格大于：相同分数不允许互相覆盖
+            acceptReason = "higherScore(\(currentBestScore)→\(score))"
+        } else {
+            print("⏭️ [WebVideo] 同分不覆盖（src=\(source), eid=\(elementId ?? "-")）: \(urlString)")
+            return
+        }
+
         guard let url = URL(string: urlString) else { return }
 
         sniffedVideoURL = url
+        currentBestScore = score
+        if let eid = elementId, !eid.isEmpty { currentBestElementId = eid }
         if let ua = ua, !ua.isEmpty { sniffedUserAgent = ua }
         if let r = referer, !r.isEmpty { sniffedReferer = r }
         if sniffedReferer == nil { sniffedReferer = lastPageURL?.absoluteString }
         if sniffedUserAgent == nil { sniffedUserAgent = desktopUA }
 
         DispatchQueue.main.async {
-            self.statusLabel.text = "已嗅到视频流（\(source)，最新覆盖）"
+            self.statusLabel.text = "已嗅到视频流（\(source)）"
             self.analyzeButton.isEnabled = true
             self.analyzeButton.backgroundColor = UIColor.systemBlue
             self.analyzeButton.setTitle("开始分析", for: .normal)
         }
-        print("✅ [WebVideo] 嗅到（覆盖到最新）: \(urlString)  src=\(source)")
+        print("✅ [WebVideo] 嗅到（\(acceptReason)）src=\(source) eid=\(elementId ?? "-"): \(urlString)")
+    }
+
+    /// 不同捕获来源的兜底分数。当前都是 1（够用），
+    /// 后续如需细分（master playlist > variant > 单 mp4）可以在这里加权。
+    private func scoreForSource(_ source: String) -> Int {
+        return 1
     }
 
     /// 严格判断：是不是一个完整容器 / playlist 的 URL。
@@ -443,12 +485,71 @@ class WebVideoViewController: UIViewController {
             return false
         }
         // 完整容器 / playlist 白名单
-        return path.hasSuffix(".mp4")
+        let okSuffix = path.hasSuffix(".mp4")
             || path.hasSuffix(".m3u8")
             || path.hasSuffix(".m3u")
             || path.hasSuffix(".webm")
             || path.hasSuffix(".mpd")
+        if !okSuffix { return false }
+        // 新增（仅对 .mp4 后缀生效）：识别带 .mp4 后缀的 fMP4 / HLS-CMAF 分片
+        // missav 用这种分片，单独喂给 AVPlayer 会报错 -11828 / -12865 之类
+        if looksLikeHlsFragment(s) {
+            print("⏭️ [WebVideo] 跳过 fMP4 分片: \(s)")
+            return false
+        }
+        return true
     }
+
+    /// 带 `.mp4` 后缀但其实是 fMP4 / HLS-CMAF 分片（init 段或媒体分片）。
+    /// missav 用 `..._h264_589_<token>_<ts>.mp4` 这种命名，必须排除。
+    /// 注意 Pornhub 的完整 mp4 `720P_4000K_50855065.mp4` 不会被这三条命中。
+    private func looksLikeHlsFragment(_ s: String) -> Bool {
+        let lower = s.lowercased()
+        // 去 query / fragment
+        var path = lower
+        if let q = path.firstIndex(of: "?") { path = String(path[..<q]) }
+        if let h = path.firstIndex(of: "#") { path = String(path[..<h]) }
+        guard path.hasSuffix(".mp4") else { return false }
+
+        // 取文件名（最后一个 / 之后）
+        let filename: String
+        if let slashIdx = path.lastIndex(of: "/") {
+            filename = String(path[path.index(after: slashIdx)...])
+        } else {
+            filename = path
+        }
+
+        // 1) init 段
+        let initKeys = ["init.mp4", "_init_", "-init-", "_init.", "-init.", "initialization"]
+        for k in initKeys where filename.contains(k) { return true }
+        if filename.hasPrefix("init.") || filename.hasPrefix("init-") || filename.hasPrefix("init_") {
+            return true
+        }
+
+        // 2) codec 标记 + 数字序号的分片
+        //    _(h264|h265|hevc|avc|vp9|av1|av01|aac)_\d+[._\-].*\.mp4
+        if Self.codecFragRegex.firstMatch(in: filename, range: NSRange(filename.startIndex..., in: filename)) != nil {
+            return true
+        }
+
+        // 3) 通用编号分片
+        //    (^|[_\-/])(seg|segment|chunk|frag|fragment)[_\-]?\d+.*\.mp4
+        if Self.namedFragRegex.firstMatch(in: filename, range: NSRange(filename.startIndex..., in: filename)) != nil {
+            return true
+        }
+
+        return false
+    }
+
+    // 提前编译好的正则；运行期失败的话退化成"不命中"，让 URL 走白名单
+    private static let codecFragRegex: NSRegularExpression = {
+        return (try? NSRegularExpression(pattern: "_(h264|h265|hevc|avc|vp9|av1|av01|aac)_\\d+[._\\-].*\\.mp4"))
+            ?? (try! NSRegularExpression(pattern: "$^"))  // never matches
+    }()
+    private static let namedFragRegex: NSRegularExpression = {
+        return (try? NSRegularExpression(pattern: "(^|[_\\-/])(seg|segment|chunk|frag|fragment)[_\\-]?\\d+.*\\.mp4"))
+            ?? (try! NSRegularExpression(pattern: "$^"))
+    }()
 
     /// trickplay / sprite / poster / 缩略图条 URL —— 这些是页面预拉的"用于 seek 悬停预览"
     /// 的迷你视频，会被嗅探器最早抓到，必须排除。
@@ -500,13 +601,30 @@ class WebVideoViewController: UIViewController {
     }
 
     private func pollVideoSrc() {
-        // 不再 short-circuit on hasSniffed —— 持续轮询，handleSniffedURL 内部会做去重
+        // 不再 short-circuit —— 持续轮询，handleSniffedURL 内部会做去重 / 覆盖判定
         guard webView != nil else { return }
-        let js = "(function(){var v=document.querySelector('video');return v?(v.src||v.currentSrc||''):'';})();"
+        // 返回 {url, elementId} 以便 Swift 端识别"同元素 src 切换"
+        let js = """
+        (function(){
+          var v = document.querySelector('video');
+          if (!v) return null;
+          var u = v.currentSrc || v.src || '';
+          if (!u) return null;
+          try {
+            if (!v.__sniffId) {
+              window.__sniffN = (window.__sniffN || 0) + 1;
+              v.__sniffId = 'v' + window.__sniffN;
+            }
+          } catch(e){}
+          return { url: u, elementId: v.__sniffId || '' };
+        })();
+        """
         webView.evaluateJavaScript(js) { [weak self] result, _ in
             guard let self = self else { return }
-            guard let s = result as? String, !s.isEmpty else { return }
-            self.handleSniffedURL(s, source: "JS轮询")
+            guard let dict = result as? [String: Any],
+                  let u = dict["url"] as? String, !u.isEmpty else { return }
+            let eid = dict["elementId"] as? String
+            self.handleSniffedURL(u, source: "JS轮询", elementId: eid)
         }
     }
 
@@ -516,6 +634,8 @@ class WebVideoViewController: UIViewController {
         sniffedVideoURL = nil
         sniffedReferer = nil
         sniffedUserAgent = nil
+        currentBestElementId = nil
+        currentBestScore = 0
         lastPageURL = pageURL
         pageRootHost = pageURL.flatMap { Self.extractRootDomain($0.host) }
         DispatchQueue.main.async {
@@ -569,6 +689,19 @@ class WebVideoViewController: UIViewController {
       var send = function(payload){
         try { window.webkit.messageHandlers.videoSniff.postMessage(payload); } catch(e){}
       };
+      // 给每个 <video> 元素分配一个稳定 id，用于 Swift 端识别"同元素 src 切换"
+      // （典型例：Pornhub 主播放器 src=广告 → src=真视频，相同 element）。
+      // 不抛错，失败就 fallback 到空 id。
+      var sniffId = function(el){
+        if (!el) return '';
+        try {
+          if (!el.__sniffId) {
+            window.__sniffN = (window.__sniffN || 0) + 1;
+            el.__sniffId = 'v' + window.__sniffN;
+          }
+          return el.__sniffId;
+        } catch(e) { return ''; }
+      };
       // 与 Swift 端 isLikelyVideoURL 保持一致：严格 endsWith 白名单 + 分片黑名单。
       // 切勿用 contains('.mp4') —— CDN 会把 .mp4/ 当目录名复用在 .ts 分片 URL 里。
       var looksVideo = function(u){
@@ -587,32 +720,32 @@ class WebVideoViewController: UIViewController {
             || path.endsWith('.mpd');
       };
 
-      // 1) fetch
+      // 1) fetch（网络层捕获，没有所属 video 元素 → elementId 为空）
       var origFetch = window.fetch;
       if (origFetch) {
         window.fetch = function(input, init){
           try {
             var u = (typeof input === 'string') ? input : (input && input.url);
             if (looksVideo(u)) {
-              send({src: 'fetch', url: u, ua: navigator.userAgent, referer: location.href});
+              send({src: 'fetch', url: u, elementId: '', ua: navigator.userAgent, referer: location.href});
             }
           } catch(e){}
           return origFetch.apply(this, arguments);
         };
       }
 
-      // 2) XHR
+      // 2) XHR（同上，没有所属 video 元素）
       var XOpen = XMLHttpRequest.prototype.open;
       XMLHttpRequest.prototype.open = function(method, url){
         try {
           if (looksVideo(url)) {
-            send({src: 'xhr', url: url, ua: navigator.userAgent, referer: location.href});
+            send({src: 'xhr', url: url, elementId: '', ua: navigator.userAgent, referer: location.href});
           }
         } catch(e){}
         return XOpen.apply(this, arguments);
       };
 
-      // 3) HTMLMediaElement.src setter
+      // 3) HTMLMediaElement.src setter（this 即为被设置的 <video> 元素 → 分配 elementId）
       try {
         var proto = HTMLMediaElement.prototype;
         var desc = Object.getOwnPropertyDescriptor(proto, 'src') ||
@@ -623,7 +756,7 @@ class WebVideoViewController: UIViewController {
             set: function(v) {
               try {
                 if (looksVideo(v)) {
-                  send({src: 'media-src', url: v, ua: navigator.userAgent, referer: location.href});
+                  send({src: 'media-src', url: v, elementId: sniffId(this), ua: navigator.userAgent, referer: location.href});
                 }
               } catch(e){}
               return origSet.call(this, v);
@@ -633,14 +766,14 @@ class WebVideoViewController: UIViewController {
         }
       } catch(e){}
 
-      // 4) 兜底：document_end 后扫描一次所有 <video>
+      // 4) 兜底：document_end 后扫描一次所有 <video>（每个元素带 id）
       var scan = function(){
         try {
           var vs = document.querySelectorAll('video');
           vs.forEach(function(v){
             var u = v.currentSrc || v.src || '';
             if (looksVideo(u)) {
-              send({src: 'dom-scan', url: u, ua: navigator.userAgent, referer: location.href});
+              send({src: 'dom-scan', url: u, elementId: sniffId(v), ua: navigator.userAgent, referer: location.href});
             }
           });
         } catch(e){}
@@ -665,8 +798,9 @@ extension WebVideoViewController: WKScriptMessageHandler {
         let src = dict["src"] as? String ?? "?"
         let ua = dict["ua"] as? String
         let ref = dict["referer"] as? String
+        let eid = dict["elementId"] as? String
         if !url.isEmpty {
-            handleSniffedURL(url, source: src, ua: ua, referer: ref)
+            handleSniffedURL(url, source: src, ua: ua, referer: ref, elementId: eid)
         }
     }
 }
