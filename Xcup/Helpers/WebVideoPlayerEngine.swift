@@ -63,6 +63,8 @@ final class WebVideoPlayerEngine: NSObject {
     private(set) var playerItem: AVPlayerItem!
     private var videoOutput: AVPlayerItemVideoOutput!
     private var audioTap: WebVideoAudioTap!
+    /// AVAssetResourceLoaderDelegate 强引用（asset.resourceLoader.setDelegate 是 weak）
+    private var hlsLoader: XcupHLSResourceLoader!
 
     private var lastObservedTimeForSeekMs: Int64 = -1
     private var periodicObserver: Any?
@@ -85,12 +87,11 @@ final class WebVideoPlayerEngine: NSObject {
         self.pendingStartMs = startMs
 
         // 1) Asset + headers
-        // AVURLAssetHTTPHeaderFieldsKey 是私有 key 但实际可用，许多大厂 App 都这样做。
-        // App Store 审核如要更稳，可改用 AVAssetResourceLoaderDelegate。
-        let options: [String: Any] = [
-            "AVURLAssetHTTPHeaderFieldsKey": headers
-        ]
-        let asset = AVURLAsset(url: videoURL, options: options)
+        // 用 AVAssetResourceLoaderDelegate 全权处理 HTTP，保证 Referer/Origin/UA/Cookie
+        // 真正被发到 manifest + segment + key 上。missav / Pornhub 这种 CDN 对
+        // segment 也校验 Referer，旧的 AVURLAssetHTTPHeaderFieldsKey 不可靠。
+        let (asset, loader) = XcupHLSResourceLoader.makeAsset(originalURL: videoURL, headers: headers)
+        self.hlsLoader = loader  // 必须强引用，setDelegate 是 weak
 
         // 2) PlayerItem
         let item = AVPlayerItem(asset: asset)

@@ -360,6 +360,10 @@ class WebVideoViewController: UIViewController {
                 var headers: [String: String] = [:]
                 if let ua = self.sniffedUserAgent { headers["User-Agent"] = ua } else { headers["User-Agent"] = self.desktopUA }
                 if let ref = self.sniffedReferer ?? self.lastPageURL?.absoluteString { headers["Referer"] = ref }
+                // Origin = scheme + host（不带 path）—— missav 这类 CDN 常和 Referer 一起校验
+                if let page = self.lastPageURL, let scheme = page.scheme, let host = page.host {
+                    headers["Origin"] = "\(scheme)://\(host)"
+                }
                 if !cookies.isEmpty { headers["Cookie"] = cookies }
 
                 self.presentAnalysisVC(videoURL: videoURL, headers: headers, startMs: startMs)
