@@ -43,9 +43,23 @@ final class WebVideoAudioTap {
     }
 
     /// 把 tap 挂到 playerItem.audioMix 上。需要 playerItem.asset 已加载完音频轨道。
+    ///
+    /// HLS 注意：很多 HLS 流的 `asset.tracks(withMediaType: .audio)` 返回空，
+    /// 因为音频走 AVMediaSelectionGroup 渲染而不是 AVAssetTrack。
+    /// 我们 fallback 到 `playerItem.tracks` 尝试拿到 rendered audio track。
+    /// 还是拿不到就只能放弃音频分析（视频分析继续跑）。
     func attach(to playerItem: AVPlayerItem) {
-        guard let audioTrack = playerItem.asset.tracks(withMediaType: .audio).first else {
-            print("❌ [WebVideoAudioTap] 未找到音频轨道")
+        var audioTrack: AVAssetTrack? = playerItem.asset.tracks(withMediaType: .audio).first
+        if audioTrack == nil {
+            audioTrack = playerItem.tracks
+                .compactMap { $0.assetTrack }
+                .first { $0.mediaType == .audio }
+            if audioTrack != nil {
+                print("ℹ️ [WebVideoAudioTap] asset.tracks 拿不到音频，fallback 到 playerItem.tracks 成功")
+            }
+        }
+        guard let audioTrack = audioTrack else {
+            print("⚠️ [WebVideoAudioTap] 未找到可用的音频 AVAssetTrack —— HLS 多渲染分离的常见情况，音频分析将不可用")
             return
         }
 

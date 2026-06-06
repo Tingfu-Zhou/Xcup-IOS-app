@@ -413,7 +413,8 @@ class WebVideoViewController: UIViewController {
                                   source: String,
                                   ua: String? = nil,
                                   referer: String? = nil,
-                                  elementId: String? = nil) {
+                                  elementId: String? = nil,
+                                  jsScore: Int? = nil) {
         // 第一道：是不是"看起来可播放的视频" URL
         guard isLikelyVideoURL(urlString) else { return }
         // 第二道：是不是 trickplay / 预览 / 缩略图条
@@ -424,21 +425,21 @@ class WebVideoViewController: UIViewController {
         // 同 URL 去重：不刷 UI 也不打日志
         if let cur = sniffedVideoURL, cur.absoluteString == urlString { return }
 
-        // 兜底来源分；后续要引入更强的来源分（manifest > variant > network）改这里
-        let score = scoreForSource(source)
+        // 实际打分：JS 端的视觉显著性分（仅 <video> 元素来源），无则 fallback 到 1
+        let score = scoreForSource(source, jsScore: jsScore)
 
         // 覆盖判定
         let acceptReason: String
         if sniffedVideoURL == nil {
-            acceptReason = "first"
+            acceptReason = "first(score=\(score))"
         } else if let eid = elementId, !eid.isEmpty, eid == currentBestElementId {
             // 同元素 src 变化：典型 Pornhub 广告→真视频，绕过 score 比较
             acceptReason = "sameElement(\(eid))"
         } else if score > currentBestScore {
-            // 严格大于：相同分数不允许互相覆盖
+            // 严格大于：分数更高才覆盖（missav 主播放器 1280×720 vs 推荐位 240×135）
             acceptReason = "higherScore(\(currentBestScore)→\(score))"
         } else {
-            print("⏭️ [WebVideo] 同分不覆盖（src=\(source), eid=\(elementId ?? "-")）: \(urlString)")
+            print("⏭️ [WebVideo] 不覆盖（src=\(source), eid=\(elementId ?? "-"), \(score) ≤ \(currentBestScore)）: \(urlString)")
             return
         }
 
@@ -461,9 +462,12 @@ class WebVideoViewController: UIViewController {
         print("✅ [WebVideo] 嗅到（\(acceptReason)）src=\(source) eid=\(elementId ?? "-"): \(urlString)")
     }
 
-    /// 不同捕获来源的兜底分数。当前都是 1（够用），
-    /// 后续如需细分（master playlist > variant > 单 mp4）可以在这里加权。
-    private func scoreForSource(_ source: String) -> Int {
+    /// 视觉显著性分（JS 端给的）优先；无则用网络层兜底分 1。
+    /// JS 端公式：rect.area * 视口可见比 * muted 惩罚因子（×0.3）。
+    /// 主播放器 1280×720 全可见 ≈ 921600；推荐位 240×135 ≈ 32400；
+    /// 推荐位若 muted 还要打 0.3 折扣 ≈ 9720。差距 ~95×，主视频稳稳赢。
+    private func scoreForSource(_ source: String, jsScore: Int?) -> Int {
+        if let s = jsScore, s > 0 { return s }
         return 1
     }
 
@@ -603,28 +607,54 @@ class WebVideoViewController: UIViewController {
     private func pollVideoSrc() {
         // 不再 short-circuit —— 持续轮询，handleSniffedURL 内部会做去重 / 覆盖判定
         guard webView != nil else { return }
-        // 返回 {url, elementId} 以便 Swift 端识别"同元素 src 切换"
+        // **扫描所有 <video>**（不是只第一个），每个都带 elementId + prominence score。
+        // missav 这类页面有主播放器 + N 个推荐位，只看第一个会被推荐位坑。
+        // 由 Swift 端 score > currentBestScore 自然挑出主视频。
         let js = """
         (function(){
-          var v = document.querySelector('video');
-          if (!v) return null;
-          var u = v.currentSrc || v.src || '';
-          if (!u) return null;
           try {
-            if (!v.__sniffId) {
-              window.__sniffN = (window.__sniffN || 0) + 1;
-              v.__sniffId = 'v' + window.__sniffN;
-            }
-          } catch(e){}
-          return { url: u, elementId: v.__sniffId || '' };
+            var vs = document.querySelectorAll('video');
+            var out = [];
+            vs.forEach(function(v){
+              var u = v.currentSrc || v.src || '';
+              if (!u) return;
+              try {
+                if (!v.__sniffId) {
+                  window.__sniffN = (window.__sniffN || 0) + 1;
+                  v.__sniffId = 'v' + window.__sniffN;
+                }
+              } catch(e){}
+              // 内联 prominence 计算（不依赖外层 IIFE 的闭包，poll 是独立调用）
+              var score = 1;
+              try {
+                var rect = v.getBoundingClientRect();
+                var w = Math.max(0, rect.width), h = Math.max(0, rect.height);
+                if (w > 0 && h > 0) {
+                  var area = w * h;
+                  var vw = window.innerWidth || 1, vh = window.innerHeight || 1;
+                  var visW = Math.max(0, Math.min(rect.right, vw) - Math.max(rect.left, 0));
+                  var visH = Math.max(0, Math.min(rect.bottom, vh) - Math.max(rect.top, 0));
+                  var vis = (visW * visH) / area;
+                  score = area * vis;
+                  if (v.muted) score *= 0.3;
+                  score = Math.max(1, Math.round(score));
+                }
+              } catch(e){}
+              out.push({ url: u, elementId: v.__sniffId || '', score: score });
+            });
+            return out;
+          } catch(e) { return []; }
         })();
         """
         webView.evaluateJavaScript(js) { [weak self] result, _ in
             guard let self = self else { return }
-            guard let dict = result as? [String: Any],
-                  let u = dict["url"] as? String, !u.isEmpty else { return }
-            let eid = dict["elementId"] as? String
-            self.handleSniffedURL(u, source: "JS轮询", elementId: eid)
+            guard let arr = result as? [[String: Any]] else { return }
+            for dict in arr {
+                guard let u = dict["url"] as? String, !u.isEmpty else { continue }
+                let eid = dict["elementId"] as? String
+                let s = (dict["score"] as? NSNumber)?.intValue
+                self.handleSniffedURL(u, source: "JS轮询", elementId: eid, jsScore: s)
+            }
         }
     }
 
@@ -702,6 +732,33 @@ class WebVideoViewController: UIViewController {
           return el.__sniffId;
         } catch(e) { return ''; }
       };
+      // **空间维度打分**：missav 这类页面有主播放器 + 一堆推荐位缩略图，
+      // 时序覆盖永远分不清哪个是主视频。改用视觉显著性：
+      //   area * 视口可见比例 * muted 惩罚因子
+      // 主播放器一般 1280x720 + 视口内，得分远高于 240x135 推荐位。
+      // 返回值规整为正整数，<video> 不存在或异常时返回 1（兜底分），
+      // 与网络层 fetch/XHR 一致，由 Swift 端的 score > 比较自然处理。
+      var computeProminence = function(v){
+        if (!v) return 1;
+        try {
+          var rect = (v.getBoundingClientRect && v.getBoundingClientRect()) || null;
+          if (!rect) return 1;
+          var w = Math.max(0, rect.width);
+          var h = Math.max(0, rect.height);
+          if (w <= 0 || h <= 0) return 1;
+          var area = w * h;
+          var vw = window.innerWidth || (document.documentElement && document.documentElement.clientWidth) || 1;
+          var vh = window.innerHeight || (document.documentElement && document.documentElement.clientHeight) || 1;
+          var visW = Math.max(0, Math.min(rect.right, vw) - Math.max(rect.left, 0));
+          var visH = Math.max(0, Math.min(rect.bottom, vh) - Math.max(rect.top, 0));
+          var visArea = visW * visH;
+          var visRatio = area > 0 ? (visArea / area) : 0;
+          var score = area * visRatio;
+          if (v.muted) score *= 0.3;            // 静音多半是推荐位 / hover 预览
+          score = Math.round(score);
+          return score > 1 ? score : 1;
+        } catch(e) { return 1; }
+      };
       // 与 Swift 端 isLikelyVideoURL 保持一致：严格 endsWith 白名单 + 分片黑名单。
       // 切勿用 contains('.mp4') —— CDN 会把 .mp4/ 当目录名复用在 .ts 分片 URL 里。
       var looksVideo = function(u){
@@ -720,32 +777,32 @@ class WebVideoViewController: UIViewController {
             || path.endsWith('.mpd');
       };
 
-      // 1) fetch（网络层捕获，没有所属 video 元素 → elementId 为空）
+      // 1) fetch（网络层捕获，没有所属 video 元素 → elementId 为空, score=1）
       var origFetch = window.fetch;
       if (origFetch) {
         window.fetch = function(input, init){
           try {
             var u = (typeof input === 'string') ? input : (input && input.url);
             if (looksVideo(u)) {
-              send({src: 'fetch', url: u, elementId: '', ua: navigator.userAgent, referer: location.href});
+              send({src: 'fetch', url: u, elementId: '', score: 1, ua: navigator.userAgent, referer: location.href});
             }
           } catch(e){}
           return origFetch.apply(this, arguments);
         };
       }
 
-      // 2) XHR（同上，没有所属 video 元素）
+      // 2) XHR（同上）
       var XOpen = XMLHttpRequest.prototype.open;
       XMLHttpRequest.prototype.open = function(method, url){
         try {
           if (looksVideo(url)) {
-            send({src: 'xhr', url: url, elementId: '', ua: navigator.userAgent, referer: location.href});
+            send({src: 'xhr', url: url, elementId: '', score: 1, ua: navigator.userAgent, referer: location.href});
           }
         } catch(e){}
         return XOpen.apply(this, arguments);
       };
 
-      // 3) HTMLMediaElement.src setter（this 即为被设置的 <video> 元素 → 分配 elementId）
+      // 3) HTMLMediaElement.src setter（this = 被设置的 <video> 元素 → 计算 prominence）
       try {
         var proto = HTMLMediaElement.prototype;
         var desc = Object.getOwnPropertyDescriptor(proto, 'src') ||
@@ -756,7 +813,7 @@ class WebVideoViewController: UIViewController {
             set: function(v) {
               try {
                 if (looksVideo(v)) {
-                  send({src: 'media-src', url: v, elementId: sniffId(this), ua: navigator.userAgent, referer: location.href});
+                  send({src: 'media-src', url: v, elementId: sniffId(this), score: computeProminence(this), ua: navigator.userAgent, referer: location.href});
                 }
               } catch(e){}
               return origSet.call(this, v);
@@ -766,14 +823,14 @@ class WebVideoViewController: UIViewController {
         }
       } catch(e){}
 
-      // 4) 兜底：document_end 后扫描一次所有 <video>（每个元素带 id）
+      // 4) 兜底：document_end 后扫描一次所有 <video>（每个元素带 id + score）
       var scan = function(){
         try {
           var vs = document.querySelectorAll('video');
           vs.forEach(function(v){
             var u = v.currentSrc || v.src || '';
             if (looksVideo(u)) {
-              send({src: 'dom-scan', url: u, elementId: sniffId(v), ua: navigator.userAgent, referer: location.href});
+              send({src: 'dom-scan', url: u, elementId: sniffId(v), score: computeProminence(v), ua: navigator.userAgent, referer: location.href});
             }
           });
         } catch(e){}
@@ -799,8 +856,9 @@ extension WebVideoViewController: WKScriptMessageHandler {
         let ua = dict["ua"] as? String
         let ref = dict["referer"] as? String
         let eid = dict["elementId"] as? String
+        let score = (dict["score"] as? NSNumber)?.intValue
         if !url.isEmpty {
-            handleSniffedURL(url, source: src, ua: ua, referer: ref, elementId: eid)
+            handleSniffedURL(url, source: src, ua: ua, referer: ref, elementId: eid, jsScore: score)
         }
     }
 }
