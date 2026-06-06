@@ -52,7 +52,6 @@ class WebVideoViewController: UIViewController {
     private var allowNextNavigation = false
 
     // 已经标记过"嗅到了，按钮可点"的状态
-    private var hasSniffed: Bool { sniffedVideoURL != nil }
 
     // 桌面 Chrome UA（很多视频站会按 UA 区分）
     private let desktopUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15"
@@ -390,11 +389,27 @@ class WebVideoViewController: UIViewController {
     }
 
     // MARK: - 嗅探入口（来自 JS / shouldStartLoad / JS poll）
+    //
+    // 策略：**持续更新到最新**（不再 first-match-wins）。
+    // 因为 Pornhub 这类站会先预拉 trickplay 缩略图条 + 广告流，真视频后到。
+    // 锁定第一个嗅到的会被预览/广告劫持，分析页只能播几秒。
+    //   1) looksLikeVideoURL：严格后缀 + 黑名单（.ts/.m4s/.m4a/.aac/.vtt 排除）
+    //   2) looksLikePreviewUrl：trickplay / sprite / 缩略图条排除
+    //   3) 同 URL 去重（避免重复刷 UI / 打日志）
+    //   4) 通过的覆盖到 sniffedVideoURL，UI 显示"已嗅到视频流（来源，最新覆盖）"
 
     private func handleSniffedURL(_ urlString: String, source: String, ua: String? = nil, referer: String? = nil) {
-        guard sniffedVideoURL == nil else { return }
+        // 第一道：是不是"看起来可播放的视频" URL
         guard isLikelyVideoURL(urlString) else { return }
+        // 第二道：是不是 trickplay / 预览 / 缩略图条
+        if looksLikePreviewUrl(urlString) {
+            print("⏭️ [WebVideo] 跳过预览/trickplay: \(urlString)")
+            return
+        }
+        // 同 URL 去重：不刷 UI 也不打日志
+        if let cur = sniffedVideoURL, cur.absoluteString == urlString { return }
         guard let url = URL(string: urlString) else { return }
+
         sniffedVideoURL = url
         if let ua = ua, !ua.isEmpty { sniffedUserAgent = ua }
         if let r = referer, !r.isEmpty { sniffedReferer = r }
@@ -402,22 +417,76 @@ class WebVideoViewController: UIViewController {
         if sniffedUserAgent == nil { sniffedUserAgent = desktopUA }
 
         DispatchQueue.main.async {
-            self.statusLabel.text = "已嗅到视频流（\(source)）"
+            self.statusLabel.text = "已嗅到视频流（\(source)，最新覆盖）"
             self.analyzeButton.isEnabled = true
             self.analyzeButton.backgroundColor = UIColor.systemBlue
             self.analyzeButton.setTitle("开始分析", for: .normal)
         }
-        print("✅ [WebVideo] 嗅到: \(urlString)  src=\(source)")
+        print("✅ [WebVideo] 嗅到（覆盖到最新）: \(urlString)  src=\(source)")
     }
 
+    /// 严格判断：是不是一个完整容器 / playlist 的 URL。
+    /// **必须严格 endsWith**，不能用 `contains(".mp4/")` 这种子串匹配 ——
+    /// CDN 经常把 `.mp4/` 当作目录段复用在 HLS `.ts` 分片 URL 里
+    /// (e.g. `.../720P_4000K_xxxxx.mp4/seg-6-v1-a1.ts?...`)
     private func isLikelyVideoURL(_ s: String) -> Bool {
         let lower = s.lowercased()
-        // 文件后缀
-        if lower.contains(".m3u8") || lower.contains(".m3u?") { return true }
-        if lower.hasSuffix(".mp4") || lower.contains(".mp4?") { return true }
-        if lower.hasSuffix(".m3u8") { return true }
-        // blob: 跳过（MSE/HLS）
         if lower.hasPrefix("blob:") { return false }
+        // 去掉 query / fragment
+        var path = lower
+        if let q = path.firstIndex(of: "?") { path = String(path[..<q]) }
+        if let h = path.firstIndex(of: "#") { path = String(path[..<h]) }
+        // HLS / DASH 分片 + 字幕：明确排除（即便后缀像 mp4 也不行）
+        if path.hasSuffix(".ts") || path.hasSuffix(".m4s")
+            || path.hasSuffix(".m4a") || path.hasSuffix(".aac")
+            || path.hasSuffix(".vtt") {
+            return false
+        }
+        // 完整容器 / playlist 白名单
+        return path.hasSuffix(".mp4")
+            || path.hasSuffix(".m3u8")
+            || path.hasSuffix(".m3u")
+            || path.hasSuffix(".webm")
+            || path.hasSuffix(".mpd")
+    }
+
+    /// trickplay / sprite / poster / 缩略图条 URL —— 这些是页面预拉的"用于 seek 悬停预览"
+    /// 的迷你视频，会被嗅探器最早抓到，必须排除。
+    private func looksLikePreviewUrl(_ s: String) -> Bool {
+        let lower = s.lowercased()
+
+        // 1) 路径关键词
+        let pathKeys = [
+            "/vts:", "/vts/", "/preview/", "/thumb/", "/thumbnail/",
+            "/sprite/", "/storyboard/", "/poster/", "/trickplay/", "/seek-thumb/",
+            "?type=preview", "&type=preview"
+        ]
+        for k in pathKeys where lower.contains(k) { return true }
+
+        // 2) Pornhub 风格 `vts:数字`
+        if let r = lower.range(of: "vts:"),
+           r.upperBound < lower.endIndex,
+           lower[r.upperBound].isNumber {
+            return true
+        }
+
+        // 3) 子域名前缀
+        if let host = URL(string: s)?.host?.lowercased() {
+            let subPrefixes = ["pix-", "thumb-", "sprite-", "preview-", "trickplay-"]
+            for p in subPrefixes where host.hasPrefix(p) { return true }
+        }
+
+        // 4) `rs:fit:W:H` 且 W*H < 240_000（约 600×400 以下）
+        if let regex = try? NSRegularExpression(pattern: "rs:fit:(\\d+):(\\d+)"),
+           let m = regex.firstMatch(in: lower, range: NSRange(lower.startIndex..., in: lower)),
+           m.numberOfRanges >= 3,
+           let wRange = Range(m.range(at: 1), in: lower),
+           let hRange = Range(m.range(at: 2), in: lower),
+           let w = Int(lower[wRange]), let h = Int(lower[hRange]),
+           w * h > 0, w * h < 240_000 {
+            return true
+        }
+
         return false
     }
 
@@ -431,7 +500,8 @@ class WebVideoViewController: UIViewController {
     }
 
     private func pollVideoSrc() {
-        guard !hasSniffed, webView != nil else { return }
+        // 不再 short-circuit on hasSniffed —— 持续轮询，handleSniffedURL 内部会做去重
+        guard webView != nil else { return }
         let js = "(function(){var v=document.querySelector('video');return v?(v.src||v.currentSrc||''):'';})();"
         webView.evaluateJavaScript(js) { [weak self] result, _ in
             guard let self = self else { return }
@@ -499,11 +569,22 @@ class WebVideoViewController: UIViewController {
       var send = function(payload){
         try { window.webkit.messageHandlers.videoSniff.postMessage(payload); } catch(e){}
       };
+      // 与 Swift 端 isLikelyVideoURL 保持一致：严格 endsWith 白名单 + 分片黑名单。
+      // 切勿用 contains('.mp4') —— CDN 会把 .mp4/ 当目录名复用在 .ts 分片 URL 里。
       var looksVideo = function(u){
         if (!u || typeof u !== 'string') return false;
         if (u.indexOf('blob:') === 0) return false;
         var lower = u.toLowerCase();
-        return lower.indexOf('.m3u8') >= 0 || lower.indexOf('.mp4') >= 0 || lower.indexOf('.m3u?') >= 0;
+        var qIdx = lower.indexOf('?');
+        var path = qIdx >= 0 ? lower.substring(0, qIdx) : lower;
+        var hIdx = path.indexOf('#');
+        if (hIdx >= 0) path = path.substring(0, hIdx);
+        if (path.endsWith('.ts') || path.endsWith('.m4s')
+            || path.endsWith('.m4a') || path.endsWith('.aac')
+            || path.endsWith('.vtt')) return false;
+        return path.endsWith('.mp4') || path.endsWith('.m3u8')
+            || path.endsWith('.m3u') || path.endsWith('.webm')
+            || path.endsWith('.mpd');
       };
 
       // 1) fetch

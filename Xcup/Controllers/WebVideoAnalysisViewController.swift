@@ -115,6 +115,10 @@ class WebVideoAnalysisViewController: UIViewController {
 
     // MARK: - 是否已经准备好（避免 ready 多次触发）
     private var didStartLoops = false
+    // 时长哨兵是否已经弹过提示（只弹一次，避免用户每次 ready 都被打断）
+    private var didShowShortDurationWarning = false
+    // 时长哨兵阈值：duration < 60s 视作可疑（预览片段/广告/trickplay）
+    private let SHORT_DURATION_THRESHOLD_MS: Int64 = 60_000
 
     // MARK: - 生命周期
 
@@ -286,7 +290,8 @@ class WebVideoAnalysisViewController: UIViewController {
                 self.progressSlider.maximumValue = Float(dur) / 1000.0
                 self.totalTimeLabel.text = Self.formatTime(Double(dur) / 1000.0)
             } else {
-                // 直播流：禁用进度条
+                // 直播流：duration 是 indefinite / NaN，按 0 处理。
+                // 注意：直播流时长哨兵不能误伤，只对 dur > 0 触发。
                 self.progressSlider.isEnabled = false
                 self.totalTimeLabel.text = "Live"
             }
@@ -297,6 +302,9 @@ class WebVideoAnalysisViewController: UIViewController {
                 self.startUIProgressTimer()
             }
             self.engine.play()
+            // 时长哨兵：嗅探兜底。如果第一次 ready 拿到一个 <60s 的时长，
+            // 多半是预览/广告/trickplay 漏过了过滤，提示用户回 WebView 等真视频。
+            self.runDurationSentinelIfNeeded()
         }
         eng.onPlayPauseChanged = { [weak self] playing in
             guard let self = self else { return }
@@ -806,6 +814,31 @@ class WebVideoAnalysisViewController: UIViewController {
         let m = (total % 3600) / 60
         let s = total % 60
         return h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%d:%02d", m, s)
+    }
+
+    // MARK: - 时长哨兵：嗅探漏过预览/广告/trickplay 的兜底
+    //
+    // HLS 直播流：duration 是 indefinite / NaN，engine 把它归一成 0 —— 这里只对 dur > 0 触发，
+    // 避免误伤直播流。
+    private func runDurationSentinelIfNeeded() {
+        guard !didShowShortDurationWarning else { return }
+        let dur = engine.durationMs
+        guard dur > 0, dur < SHORT_DURATION_THRESHOLD_MS else { return }
+        didShowShortDurationWarning = true
+
+        let seconds = Double(dur) / 1000.0
+        let msg = String(format:
+            "视频时长仅 %.1f 秒，疑似预览片段、广告或缩略图条。\n" +
+            "建议返回上一页，等真视频在网页里开始播放后再点「开始分析」。",
+            seconds)
+
+        let alert = UIAlertController(title: "时长异常", message: msg, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "返回浏览", style: .default) { [weak self] _ in
+            self?.cleanup()
+            self?.dismiss(animated: true)
+        })
+        alert.addAction(UIAlertAction(title: "继续分析", style: .cancel))
+        present(alert, animated: true)
     }
 
     // MARK: - Cleanup
