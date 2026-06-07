@@ -65,6 +65,9 @@ final class WebVideoPlayerEngine: NSObject {
     private var audioTap: WebVideoAudioTap!
 
     private var lastObservedTimeForSeekMs: Int64 = -1
+    /// 第一次进入 readyToPlay 的 wall-clock，用来给 seek 检测留 3 秒静默期 ——
+    /// 避免 AVPlayer 从 0 跳到首段 buffered 位置时被当成用户拖动。
+    private var readyAtWallClockMs: Int64 = 0
     private var periodicObserver: Any?
     private var endObserver: NSObjectProtocol?
     private var statusObservation: NSKeyValueObservation?
@@ -131,6 +134,9 @@ final class WebVideoPlayerEngine: NSObject {
                 case .readyToPlay:
                     let secs = CMTimeGetSeconds(item.duration)
                     self.durationMs = (secs.isFinite && secs > 0) ? Int64(secs * 1000) : 0
+                    if self.readyAtWallClockMs == 0 {
+                        self.readyAtWallClockMs = Int64(Date().timeIntervalSince1970 * 1000)
+                    }
                     // tap 必须在 readyToPlay 之后挂（HLS 的 audio track 这时才可见）
                     if item.audioMix == nil {
                         self.audioTap.attach(to: item)
@@ -171,7 +177,12 @@ final class WebVideoPlayerEngine: NSObject {
             guard let self = self else { return }
             let curMs = Int64(time.seconds.isFinite ? time.seconds * 1000 : 0)
             // 检测 seek：与上次观测差 > 1 秒视为 seek
-            if self.lastObservedTimeForSeekMs >= 0 {
+            // **静默期**：readyToPlay 后头 3 秒不检测 ——
+            // AVPlayer 起播时 position 会从 0 蹦到首段 buffered 时间（可能 5+ 秒），
+            // 不是用户拖动，不该当作 seek。
+            let now = Int64(Date().timeIntervalSince1970 * 1000)
+            let inGracePeriod = self.readyAtWallClockMs > 0 && (now - self.readyAtWallClockMs) < 3000
+            if !inGracePeriod, self.lastObservedTimeForSeekMs >= 0 {
                 let delta = abs(curMs - self.lastObservedTimeForSeekMs)
                 if delta > 1000 {
                     self.onUserSeek?(curMs)

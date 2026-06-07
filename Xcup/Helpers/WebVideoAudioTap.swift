@@ -38,6 +38,11 @@ final class WebVideoAudioTap {
     fileprivate var lastSourceTail: Float = 0
     fileprivate var hasLastTail: Bool = false
 
+    // 诊断：tap 是否真的在 fire（HLS 某些 routing 下 tap 不会被调用）
+    fileprivate var diagCallCount: Int = 0
+    fileprivate var diagTotalFrames: Int = 0
+    fileprivate var diagLastLogMs: Int64 = 0
+
     init(pcmBuffer: PcmCircularBuffer) {
         self.pcmBuffer = pcmBuffer
     }
@@ -166,6 +171,15 @@ private func webvideo_tap_process(
 
     let storage = MTAudioProcessingTapGetStorage(tap)
     let me = Unmanaged<WebVideoAudioTap>.fromOpaque(storage).takeUnretainedValue()
+
+    // 诊断：每 ~2 秒打一行，确认 tap 在 fire
+    me.diagCallCount += 1
+    me.diagTotalFrames += Int(frameCount)
+    let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+    if nowMs - me.diagLastLogMs > 2000 {
+        me.diagLastLogMs = nowMs
+        print("[Tap] calls=\(me.diagCallCount), frames=\(me.diagTotalFrames), sr=\(me.sourceSampleRate), ch=\(me.sourceChannels)")
+    }
 
     // 2) 从 AudioBufferList 拿到 Float32 数据 → 下混成 mono
     //    AVPlayer 的 tap 默认是 Float32 非交错（每声道一个 buffer），但保险起见两种都处理。

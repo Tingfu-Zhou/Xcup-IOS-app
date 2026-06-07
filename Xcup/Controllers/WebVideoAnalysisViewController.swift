@@ -310,8 +310,15 @@ class WebVideoAnalysisViewController: UIViewController {
             guard let self = self else { return }
             let icon = playing ? "pause.fill" : "play.fill"
             self.btnPlayPause.setImage(UIImage(systemName: icon), for: .normal)
-            // 注意：不要在这里 pauseAnalysis/resumeAnalysis ——
-            // 网页流的 isPlaying=true 时也可能是广告/缓冲。交给 VAD 控制。
+            // 网页视频模式 URL 本身就是用户的"目标视频"，不存在"是不是广告"的歧义 ——
+            // 直接用 isPlaying 作为分析门控就够了，比 VAD 简单且不依赖 audio tap 工作
+            if playing {
+                self.resumeAnalysis(reason: "player playing")
+                DispatchQueue.main.async { self.statusLabel.text = "在线分析中" }
+            } else {
+                self.pauseAnalysis(reason: "player paused")
+                DispatchQueue.main.async { self.statusLabel.text = "已暂停" }
+            }
         }
         eng.onUserSeek = { [weak self] ms in
             self?.handleSeekCleanup(toMs: ms)
@@ -356,8 +363,6 @@ class WebVideoAnalysisViewController: UIViewController {
     }
     private func runAudioTick() {
         let t0 = DispatchTime.now()
-        // VAD 总是先跑（不分析也要跟踪声音是否回来）
-        runVadTick()
         if !isAnalysisPaused { performAudioAnalysis() }
         let elapsed = Int64((DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1_000_000)
         scheduleAudioTick(afterMs: max(0, AUDIO_INTERVAL_MS - elapsed))
