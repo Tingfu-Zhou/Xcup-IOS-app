@@ -159,9 +159,29 @@ final class XcupHLSResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
             return
         }
 
+        // 判断是 manifest 还是 segment
+        let urlLowerFull = realURL.absoluteString.lowercased()
+        let mime = (http.mimeType ?? "").lowercased()
+        let isManifest = mime.contains("mpegurl") || mime.contains("dash+xml")
+            || urlLowerFull.contains(".m3u8") || urlLowerFull.contains(".m3u")
+            || urlLowerFull.contains(".mpd")
+
+        // 成功日志（方便看 segment 拿到的实际 content-type / 大小）
+        print("✅ [XcupHLS] \(http.statusCode) \(realURL.lastPathComponent) (\(data.count)B, type=\(http.mimeType ?? "?"))")
+
         // 设置 contentInformation（如果 AVPlayer 问）
         if let info = loadingRequest.contentInformationRequest {
-            info.contentType = http.mimeType
+            if isManifest {
+                info.contentType = http.mimeType?.isEmpty == false
+                    ? http.mimeType
+                    : "application/vnd.apple.mpegurl"
+            } else {
+                // **关键**：HLS segment 即使被服务端伪装成 image/jpeg 也强制 video/MP2T
+                // （missav 这类站把 .ts 分片改名成 video0.jpeg、Content-Type: image/jpeg
+                //  绕开 ISP DPI 过滤；ExoPlayer 不看 type 直接 demux 能用，
+                //  AVPlayer 严格校验 type，看到 image/jpeg 会 -12881 直接拒）
+                info.contentType = "video/MP2T"
+            }
             info.contentLength = http.expectedContentLength
             let ranges = (http.value(forHTTPHeaderField: "Accept-Ranges") ?? "").lowercased()
             info.isByteRangeAccessSupported = ranges.contains("bytes")
@@ -169,12 +189,13 @@ final class XcupHLSResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
 
         // 如果是 m3u8 / mpd manifest，重写里面的 URL 让 segment 也走我们
         var payload = data
-        let mime = (http.mimeType ?? "").lowercased()
-        let isManifest = mime.contains("mpegurl") || mime.contains("dash+xml")
-            || realURL.absoluteString.lowercased().contains(".m3u8")
-            || realURL.absoluteString.lowercased().contains(".m3u")
-            || realURL.absoluteString.lowercased().contains(".mpd")
         if isManifest, let text = String(data: data, encoding: .utf8) {
+            // 诊断：第一次拿到 manifest 时把内容前 800 字符贴出来
+            if text.count <= 800 {
+                print("⬇️ [XcupHLS] manifest 完整内容:\n\(text)")
+            } else {
+                print("⬇️ [XcupHLS] manifest 前 800B:\n\(text.prefix(800))")
+            }
             let rewritten = rewriteManifest(text, baseURL: realURL)
             payload = rewritten.data(using: .utf8) ?? data
         }
