@@ -283,6 +283,43 @@ class OnlineAnalysisViewController: UIViewController {
             startOverlay.bottomAnchor.constraint(equalTo: view.bottomAnchor)
         ])
 
+        // ── 隐藏的系统 Picker（1×1，藏在角落，仅用于通过代码触发系统广播对话框）──
+        let picker = RPSystemBroadcastPickerView(frame: CGRect(x: 0, y: 0, width: 1, height: 1))
+        picker.preferredExtension = "com.aibei.Xcup.XcupBroadcast"
+        picker.showsMicrophoneButton = false
+        picker.translatesAutoresizingMaskIntoConstraints = false
+        broadcastPicker = picker
+        startOverlay.addSubview(picker)
+        NSLayoutConstraint.activate([
+            picker.leadingAnchor.constraint(equalTo: startOverlay.leadingAnchor),
+            picker.topAnchor.constraint(equalTo: startOverlay.topAnchor),
+            picker.widthAnchor.constraint(equalToConstant: 1),
+            picker.heightAnchor.constraint(equalToConstant: 1),
+        ])
+
+        // ── 可滚动内容区域（提示内容较多，小屏设备可能需要滚动）──
+        let scrollView = UIScrollView()
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.showsVerticalScrollIndicator = false
+        startOverlay.addSubview(scrollView)
+        NSLayoutConstraint.activate([
+            scrollView.leadingAnchor.constraint(equalTo: startOverlay.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: startOverlay.trailingAnchor),
+            scrollView.topAnchor.constraint(equalTo: startOverlay.safeAreaLayoutGuide.topAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: startOverlay.bottomAnchor)
+        ])
+
+        let contentView = UIView()
+        contentView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.addSubview(contentView)
+        NSLayoutConstraint.activate([
+            contentView.leadingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.leadingAnchor),
+            contentView.trailingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.trailingAnchor),
+            contentView.topAnchor.constraint(equalTo: scrollView.contentLayoutGuide.topAnchor),
+            contentView.bottomAnchor.constraint(equalTo: scrollView.contentLayoutGuide.bottomAnchor),
+            contentView.widthAnchor.constraint(equalTo: scrollView.frameLayoutGuide.widthAnchor)
+        ])
+
         // 图标（MD3 hero icon）
         let iconView = UIImageView()
         iconView.image = UIImage(systemName: "dot.radiowaves.left.and.right",
@@ -308,19 +345,22 @@ class OnlineAnalysisViewController: UIViewController {
         descLabel.numberOfLines = 0
         descLabel.translatesAutoresizingMaskIntoConstraints = false
 
-        // ── 隐藏的系统 Picker（1×1，藏在角落，仅用于通过代码触发系统广播对话框）──
-        let picker = RPSystemBroadcastPickerView(frame: CGRect(x: 0, y: 0, width: 1, height: 1))
-        picker.preferredExtension = "com.aibei.Xcup.XcupBroadcast"
-        picker.showsMicrophoneButton = false
-        picker.translatesAutoresizingMaskIntoConstraints = false
-        broadcastPicker = picker
-        startOverlay.addSubview(picker)
-        NSLayoutConstraint.activate([
-            picker.leadingAnchor.constraint(equalTo: startOverlay.leadingAnchor),
-            picker.topAnchor.constraint(equalTo: startOverlay.topAnchor),
-            picker.widthAnchor.constraint(equalToConstant: 1),
-            picker.heightAnchor.constraint(equalToConstant: 1),
-        ])
+        // ── 用户提示卡片 ──
+        let tip1 = makeTipCard(
+            icon: "play.rectangle",
+            title: "推荐观看方式",
+            body: "建议将手机横屏并全屏播放视频，识别效果最佳。"
+        )
+        let tip2 = makeTipCard(
+            icon: "exclamationmark.triangle",
+            title: "温馨提示",
+            body: "部分浏览器（如 Chrome、Firefox）出于安全考虑，会自动将屏幕共享中的视频画面遮黑，并显示「为了安全起见，屏幕共享画面已隐藏此应用的内容」等提示。为了保证分析的准确性，录屏模式建议使用对应视频网站的官方 App 直接观看视频（部分 App 会禁止屏幕/音频抓取）。"
+        )
+        let tip3 = makeTipCard(
+            icon: "stop.circle",
+            title: "退出提示",
+            body: "如需退出在线分析，可点击屏幕上方通知栏「直播屏幕」，并点击停止按钮。"
+        )
 
         // ── MD3 Filled Primary 按钮 ──
         let broadcastBtn = UIButton(type: .system)
@@ -334,28 +374,89 @@ class OnlineAnalysisViewController: UIViewController {
         broadcastBtn.layer.masksToBounds = true
         broadcastBtn.addTarget(self, action: #selector(onBroadcastButtonTapped), for: .touchUpInside)
 
-        [iconView, titleLabel, descLabel, broadcastBtn].forEach {
-            startOverlay.addSubview($0)
+        [iconView, titleLabel, descLabel, tip1, tip2, tip3, broadcastBtn].forEach {
+            contentView.addSubview($0)
         }
 
         NSLayoutConstraint.activate([
-            iconView.centerXAnchor.constraint(equalTo: startOverlay.centerXAnchor),
-            iconView.centerYAnchor.constraint(equalTo: startOverlay.centerYAnchor, constant: -150),
+            iconView.centerXAnchor.constraint(equalTo: contentView.centerXAnchor),
+            iconView.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 40),
             iconView.widthAnchor.constraint(equalToConstant: 80),
             iconView.heightAnchor.constraint(equalToConstant: 80),
 
             titleLabel.topAnchor.constraint(equalTo: iconView.bottomAnchor, constant: 16),
-            titleLabel.centerXAnchor.constraint(equalTo: startOverlay.centerXAnchor),
+            titleLabel.centerXAnchor.constraint(equalTo: contentView.centerXAnchor),
 
             descLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 12),
-            descLabel.leadingAnchor.constraint(equalTo: startOverlay.leadingAnchor, constant: 32),
-            descLabel.trailingAnchor.constraint(equalTo: startOverlay.trailingAnchor, constant: -32),
+            descLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 32),
+            descLabel.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -32),
 
-            broadcastBtn.topAnchor.constraint(equalTo: descLabel.bottomAnchor, constant: 40),
-            broadcastBtn.centerXAnchor.constraint(equalTo: startOverlay.centerXAnchor),
+            tip1.topAnchor.constraint(equalTo: descLabel.bottomAnchor, constant: 24),
+            tip1.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 24),
+            tip1.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -24),
+
+            tip2.topAnchor.constraint(equalTo: tip1.bottomAnchor, constant: 12),
+            tip2.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 24),
+            tip2.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -24),
+
+            tip3.topAnchor.constraint(equalTo: tip2.bottomAnchor, constant: 12),
+            tip3.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 24),
+            tip3.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -24),
+
+            broadcastBtn.topAnchor.constraint(equalTo: tip3.bottomAnchor, constant: 32),
+            broadcastBtn.centerXAnchor.constraint(equalTo: contentView.centerXAnchor),
             broadcastBtn.widthAnchor.constraint(equalToConstant: 220),
             broadcastBtn.heightAnchor.constraint(equalToConstant: 56),
+            broadcastBtn.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -40)
         ])
+    }
+
+    private func makeTipCard(icon: String, title: String, body: String) -> UIView {
+        let card = UIView()
+        card.translatesAutoresizingMaskIntoConstraints = false
+        card.backgroundColor = .md3Surface
+        card.layer.cornerRadius = 12
+        card.layer.cornerCurve = .continuous
+
+        let iconView = UIImageView()
+        iconView.image = UIImage(systemName: icon,
+                                  withConfiguration: UIImage.SymbolConfiguration(pointSize: 14, weight: .medium))
+        iconView.tintColor = .md3Primary
+        iconView.contentMode = .scaleAspectFit
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+
+        let titleLabel = UILabel()
+        titleLabel.text = title
+        titleLabel.font = .systemFont(ofSize: 14, weight: .semibold)
+        titleLabel.textColor = .md3OnSurface
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        let bodyLabel = UILabel()
+        bodyLabel.text = body
+        bodyLabel.font = .systemFont(ofSize: 13, weight: .regular)
+        bodyLabel.textColor = .md3OnSurfaceVariant
+        bodyLabel.numberOfLines = 0
+        bodyLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        [iconView, titleLabel, bodyLabel].forEach { card.addSubview($0) }
+
+        NSLayoutConstraint.activate([
+            iconView.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 16),
+            iconView.topAnchor.constraint(equalTo: card.topAnchor, constant: 14),
+            iconView.widthAnchor.constraint(equalToConstant: 18),
+            iconView.heightAnchor.constraint(equalToConstant: 18),
+
+            titleLabel.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 8),
+            titleLabel.centerYAnchor.constraint(equalTo: iconView.centerYAnchor),
+            titleLabel.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -16),
+
+            bodyLabel.topAnchor.constraint(equalTo: iconView.bottomAnchor, constant: 8),
+            bodyLabel.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 16),
+            bodyLabel.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -16),
+            bodyLabel.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -14)
+        ])
+
+        return card
     }
 
     // 点击红色按钮 → 找到 picker 内部的系统按钮并程序化触发，弹出系统广播选择对话框

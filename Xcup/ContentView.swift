@@ -114,6 +114,23 @@ struct ContentView: View {
                                 .ignoresSafeArea()
                         }
 
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: "info.circle.fill")
+                                .font(.system(size: 14))
+                                .foregroundColor(.md3Primary)
+                                .padding(.top, 1)
+                            Text("iOS 端暂不支持网页视频模式，请使用「在线视频模式」通过屏幕录制进行在线分析。")
+                                .font(MD3Typography.bodySmall)
+                                .foregroundColor(.md3OnSurfaceVariant)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .padding(12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .fill(Color.md3Surface)
+                        )
+
                         // [新增] 恢复控制按钮
                         Button(action: {
                             handleResumeControl()
