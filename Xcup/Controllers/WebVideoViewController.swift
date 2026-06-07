@@ -372,23 +372,46 @@ class WebVideoViewController: UIViewController {
             self.prefetchInWebView(videoURL) { [weak self] in
                 guard let self = self else { return }
 
-                // 再拿 Cookie（这时应该有 surrit.com 的 __cf_bm 了）
-                self.collectCookies(for: videoURL) { cookies in
-                    var headers: [String: String] = [:]
-                    if let ua = self.sniffedUserAgent { headers["User-Agent"] = ua } else { headers["User-Agent"] = self.desktopUA }
-                    // Referer 必须用 main frame URL —— 广告 iframe 嗅探会污染 sniffedReferer，
-                    // 直接拿 lastPageURL（webView.url）最稳。
-                    if let ref = self.lastPageURL?.absoluteString { headers["Referer"] = ref }
-                    // Origin = scheme + host（不带 path）—— missav 这类 CDN 常和 Referer 一起校验
-                    if let page = self.lastPageURL, let scheme = page.scheme, let host = page.host {
-                        headers["Origin"] = "\(scheme)://\(host)"
-                    }
-                    if !cookies.isEmpty { headers["Cookie"] = cookies }
+                // **关键**：把 WebView 的所有 cookie 复制到 HTTPCookieStorage.shared，
+                // AVPlayer 内部 HLS 引擎 fetch segment 时会读 system cookie store。
+                // 这样 Cloudflare __cf_bm 等 bot cookie 才会被自动带到 segment 请求上。
+                self.syncWebViewCookiesToSystemStorage { [weak self] in
+                    guard let self = self else { return }
 
-                    restoreButton()
-                    self.presentAnalysisVC(videoURL: videoURL, headers: headers, startMs: startMs)
+                    // 再拿 Cookie（这时应该有 surrit.com 的 __cf_bm 了）
+                    self.collectCookies(for: videoURL) { cookies in
+                        var headers: [String: String] = [:]
+                        if let ua = self.sniffedUserAgent { headers["User-Agent"] = ua } else { headers["User-Agent"] = self.desktopUA }
+                        // Referer 必须用 main frame URL —— 广告 iframe 嗅探会污染 sniffedReferer，
+                        // 直接拿 lastPageURL（webView.url）最稳。
+                        if let ref = self.lastPageURL?.absoluteString { headers["Referer"] = ref }
+                        // Origin = scheme + host（不带 path）—— missav 这类 CDN 常和 Referer 一起校验
+                        if let page = self.lastPageURL, let scheme = page.scheme, let host = page.host {
+                            headers["Origin"] = "\(scheme)://\(host)"
+                        }
+                        if !cookies.isEmpty { headers["Cookie"] = cookies }
+
+                        restoreButton()
+                        self.presentAnalysisVC(videoURL: videoURL, headers: headers, startMs: startMs)
+                    }
                 }
             }
+        }
+    }
+
+    /// 把 WKWebView 的所有 cookie 复制到 HTTPCookieStorage.shared，
+    /// 让 AVPlayer 内部 HLS 引擎 fetch segment 时能用上。
+    /// AVPlayer 不读 WKWebView 的 cookie store，必须经过 system store 这个桥。
+    private func syncWebViewCookiesToSystemStorage(completion: @escaping () -> Void) {
+        WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
+            let sys = HTTPCookieStorage.shared
+            var copied = 0
+            for c in cookies {
+                sys.setCookie(c)
+                copied += 1
+            }
+            print("🍪 [Cookie] 已把 \(copied) 个 WebView cookie 复制到 system store")
+            DispatchQueue.main.async { completion() }
         }
     }
 

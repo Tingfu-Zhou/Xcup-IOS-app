@@ -63,8 +63,6 @@ final class WebVideoPlayerEngine: NSObject {
     private(set) var playerItem: AVPlayerItem!
     private var videoOutput: AVPlayerItemVideoOutput!
     private var audioTap: WebVideoAudioTap!
-    /// AVAssetResourceLoaderDelegate 强引用（asset.resourceLoader.setDelegate 是 weak）
-    private var hlsLoader: XcupHLSResourceLoader!
 
     private var lastObservedTimeForSeekMs: Int64 = -1
     private var periodicObserver: Any?
@@ -87,11 +85,18 @@ final class WebVideoPlayerEngine: NSObject {
         self.pendingStartMs = startMs
 
         // 1) Asset + headers
-        // 用 AVAssetResourceLoaderDelegate 全权处理 HTTP，保证 Referer/Origin/UA/Cookie
-        // 真正被发到 manifest + segment + key 上。missav / Pornhub 这种 CDN 对
-        // segment 也校验 Referer，旧的 AVURLAssetHTTPHeaderFieldsKey 不可靠。
-        let (asset, loader) = XcupHLSResourceLoader.makeAsset(originalURL: videoURL, headers: headers)
-        self.hlsLoader = loader  // 必须强引用，setDelegate 是 weak
+        // 用 https 原 URL + AVURLAssetHTTPHeaderFieldsKey。
+        // **不能用** custom scheme + AVAssetResourceLoaderDelegate 拦截 segment ——
+        // 那条路在 manifest 和 AES key 上 OK，但代理 segment 会让 AVPlayer 把整个
+        // asset 当 "一个文件资源"处理，不再调内部 HLS demuxer 引擎，结果就是
+        // CoreMediaErrorDomain -12881（即便我们交付的真是合法 TS）。
+        // 关键 cookie（如 Cloudflare __cf_bm）由 WebVideoViewController 在
+        // 跳过来前从 WKHTTPCookieStore 复制到 HTTPCookieStorage.shared，
+        // AVPlayer 内部 HTTP 会读 system cookie store。
+        let options: [String: Any] = [
+            "AVURLAssetHTTPHeaderFieldsKey": headers
+        ]
+        let asset = AVURLAsset(url: videoURL, options: options)
 
         // 2) PlayerItem
         let item = AVPlayerItem(asset: asset)
