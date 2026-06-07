@@ -70,8 +70,16 @@ final class XcupHLSResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
 
         var req = URLRequest(url: realURL)
         req.httpMethod = "GET"
+        // 注入用户传入的 headers（Referer / Cookie / User-Agent / Origin 等）
         for (k, v) in headers {
             req.setValue(v, forHTTPHeaderField: k)
+        }
+        // 补一些浏览器请求 .m3u8 时的常见 header，提升 CDN 接受率
+        if req.value(forHTTPHeaderField: "Accept") == nil {
+            req.setValue("*/*", forHTTPHeaderField: "Accept")
+        }
+        if req.value(forHTTPHeaderField: "Accept-Language") == nil {
+            req.setValue("en-US,en;q=0.9", forHTTPHeaderField: "Accept-Language")
         }
         // 转发 AVPlayer 自带的 Range header（如果有）
         if let dataRequest = loadingRequest.dataRequest {
@@ -84,6 +92,13 @@ final class XcupHLSResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
                 req.setValue("bytes=\(from)-\(end)", forHTTPHeaderField: "Range")
             }
         }
+
+        // === 诊断日志：完整列出我们发出去的 header ===
+        let dump = (req.allHTTPHeaderFields ?? [:])
+            .map { "    \($0.key): \($0.value)" }
+            .sorted()
+            .joined(separator: "\n")
+        print("➡️ [XcupHLS] GET \(realURL.absoluteString)\n\(dump)")
 
         let key = ObjectIdentifier(loadingRequest)
         let task = session.dataTask(with: req) { [weak self] data, response, error in
@@ -130,6 +145,15 @@ final class XcupHLSResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
         if http.statusCode >= 400 {
             let msg = "HTTP \(http.statusCode): \(realURL.absoluteString)"
             print("❌ [XcupHLS] \(msg)")
+            // === 诊断：打印响应 headers + 响应体前 512 字节，方便排查 CDN 拒绝原因 ===
+            let respHeadersDump = http.allHeaderFields
+                .map { "    \($0.key): \($0.value)" }
+                .sorted()
+                .joined(separator: "\n")
+            print("⬅️ [XcupHLS] resp headers:\n\(respHeadersDump)")
+            if let body = String(data: data.prefix(512), encoding: .utf8), !body.isEmpty {
+                print("⬅️ [XcupHLS] resp body[<=512B]: \(body)")
+            }
             loadingRequest.finishLoading(with: NSError(domain: "Xcup.HLS", code: http.statusCode,
                 userInfo: [NSLocalizedDescriptionKey: msg]))
             return
