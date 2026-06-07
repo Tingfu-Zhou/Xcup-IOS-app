@@ -80,7 +80,8 @@ class PcmCircularBuffer {
             }
             
             if count < Int(Float(sampleCount) * 0.9) {
-                print("🚫 readWindowRelaxed: 样本太少，本轮放弃分析")
+                // 样本太少：以前每次都打印会刷屏，现在静默 nil 返回 ——
+                // 调用方决定要不要打日志（VAD/分析层通常都是预期失败的，沉默更合适）
                 result = nil
             } else {
                 if count < sampleCount {

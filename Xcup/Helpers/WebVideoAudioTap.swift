@@ -54,12 +54,27 @@ final class WebVideoAudioTap {
     /// 我们 fallback 到 `playerItem.tracks` 尝试拿到 rendered audio track。
     /// 还是拿不到就只能放弃音频分析（视频分析继续跑）。
     func attach(to playerItem: AVPlayerItem) {
-        var audioTrack: AVAssetTrack? = playerItem.asset.tracks(withMediaType: .audio).first
+        // === 诊断：罗列所有 playerItem.tracks 和 asset.tracks(.audio) ===
+        let assetAudioTracks = playerItem.asset.tracks(withMediaType: .audio)
+        print("[Tap-attach] asset.tracks(.audio) count=\(assetAudioTracks.count)")
+        for (i, t) in assetAudioTracks.enumerated() {
+            print("[Tap-attach]   asset.audio[\(i)]: trackID=\(t.trackID), enabled=\(t.isEnabled), playable=\(t.isPlayable)")
+        }
+        print("[Tap-attach] playerItem.tracks count=\(playerItem.tracks.count)")
+        for (i, pt) in playerItem.tracks.enumerated() {
+            let mt = pt.assetTrack?.mediaType.rawValue ?? "(assetTrack==nil)"
+            let tid = pt.assetTrack?.trackID.description ?? "?"
+            print("[Tap-attach]   playerItem.tracks[\(i)]: media=\(mt) trackID=\(tid) enabled=\(pt.isEnabled)")
+        }
+
+        var audioTrack: AVAssetTrack? = assetAudioTracks.first
+        var source = "asset.tracks"
         if audioTrack == nil {
             audioTrack = playerItem.tracks
                 .compactMap { $0.assetTrack }
                 .first { $0.mediaType == .audio }
             if audioTrack != nil {
+                source = "playerItem.tracks"
                 print("ℹ️ [WebVideoAudioTap] asset.tracks 拿不到音频，fallback 到 playerItem.tracks 成功")
             }
         }
@@ -67,6 +82,7 @@ final class WebVideoAudioTap {
             print("⚠️ [WebVideoAudioTap] 未找到可用的音频 AVAssetTrack —— HLS 多渲染分离的常见情况，音频分析将不可用")
             return
         }
+        print("[Tap-attach] 选中 audioTrack: trackID=\(audioTrack.trackID), 来源=\(source)")
 
         var callbacks = MTAudioProcessingTapCallbacks(
             version: kMTAudioProcessingTapCallbacksVersion_0,
@@ -90,6 +106,7 @@ final class WebVideoAudioTap {
             return
         }
         self.tap = createdTap
+        print("[Tap-attach] MTAudioProcessingTapCreate 成功")
 
         let params = AVMutableAudioMixInputParameters(track: audioTrack)
         params.audioTapProcessor = createdTap
@@ -99,7 +116,13 @@ final class WebVideoAudioTap {
         playerItem.audioMix = mix
         self.audioMix = mix
 
-        print("✅ [WebVideoAudioTap] 挂载成功")
+        print("✅ [WebVideoAudioTap] 挂载成功（playerItem.audioMix 已设置: \(playerItem.audioMix != nil)）")
+
+        // 1 秒后回头看 audioMix 是否被 AVPlayer 内部清掉了
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self, weak playerItem] in
+            guard let _ = self, let playerItem = playerItem else { return }
+            print("[Tap-attach] 1s 后回头检查: playerItem.audioMix == \(playerItem.audioMix != nil ? "still set" : "NIL")")
+        }
     }
 
     /// 从 audio 线程喂数据。已经是单声道 Float32 且目标采样率 16000。
@@ -123,9 +146,11 @@ private func webvideo_tap_init(
 ) {
     // clientInfo 是 passRetained(self) 的指针；存到 tap storage 里
     tapStorageOut.pointee = clientInfo
+    print("✅ [Tap-init] 被调用了（tap 已注册到音频链）")
 }
 
 private func webvideo_tap_finalize(_ tap: MTAudioProcessingTap) {
+    print("⚠️ [Tap-finalize] 被调用了（tap 被销毁）")
     let storage = MTAudioProcessingTapGetStorage(tap)
     Unmanaged<WebVideoAudioTap>.fromOpaque(storage).release()
 }
@@ -145,11 +170,13 @@ private func webvideo_tap_prepare(
     let resampledMax = max(Int(maxFrames), Int(Double(maxFrames) * 16000.0 / max(1.0, me.sourceSampleRate)) + 16)
     me.resampleScratch = [Float](repeating: 0, count: resampledMax * 2)
     me.hasLastTail = false
-    print("✅ [WebVideoAudioTap] prepare: sr=\(me.sourceSampleRate) ch=\(me.sourceChannels) maxFrames=\(maxFrames)")
+    let fmtId = format.pointee.mFormatID
+    let fmtFlags = format.pointee.mFormatFlags
+    print("✅ [Tap-prepare] 被调用了！sr=\(me.sourceSampleRate) ch=\(me.sourceChannels) maxFrames=\(maxFrames) formatID=0x\(String(fmtId, radix: 16)) flags=0x\(String(fmtFlags, radix: 16))")
 }
 
 private func webvideo_tap_unprepare(_ tap: MTAudioProcessingTap) {
-    // no-op
+    print("⚠️ [Tap-unprepare] 被调用了")
 }
 
 private func webvideo_tap_process(
@@ -172,9 +199,12 @@ private func webvideo_tap_process(
     let storage = MTAudioProcessingTapGetStorage(tap)
     let me = Unmanaged<WebVideoAudioTap>.fromOpaque(storage).takeUnretainedValue()
 
-    // 诊断：每 ~2 秒打一行，确认 tap 在 fire
+    // 诊断：第一次进入立即打印（不等 2 秒间隔），之后每 ~2 秒一行
     me.diagCallCount += 1
     me.diagTotalFrames += Int(frameCount)
+    if me.diagCallCount == 1 {
+        print("✅ [Tap-process] 第一次被调用！frames=\(frameCount), sr=\(me.sourceSampleRate), ch=\(me.sourceChannels)")
+    }
     let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
     if nowMs - me.diagLastLogMs > 2000 {
         me.diagLastLogMs = nowMs
