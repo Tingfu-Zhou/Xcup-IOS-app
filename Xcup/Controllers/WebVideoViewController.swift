@@ -349,25 +349,90 @@ class WebVideoViewController: UIViewController {
     @objc private func onAnalyzeTapped() {
         guard let videoURL = sniffedVideoURL else { return }
 
+        // 准备中状态（点之后可能要等 prefetch 几百毫秒）
+        analyzeButton.isEnabled = false
+        let originalTitle = analyzeButton.title(for: .normal)
+        analyzeButton.setTitle("正在准备...", for: .normal)
+
+        let restoreButton: () -> Void = { [weak self] in
+            guard let self = self else { return }
+            self.analyzeButton.isEnabled = true
+            self.analyzeButton.setTitle(originalTitle, for: .normal)
+        }
+
         // 先取 currentTime 作为起播位置
         webView.evaluateJavaScript("(function(){var v=document.querySelector('video');return v?v.currentTime:0;})();") { [weak self] result, _ in
             guard let self = self else { return }
             let startSec = (result as? Double) ?? Double((result as? NSNumber)?.doubleValue ?? 0)
             let startMs = Int64(max(0, startSec) * 1000)
 
-            // 再拿 Cookie
-            self.collectCookies(for: videoURL) { cookies in
-                var headers: [String: String] = [:]
-                if let ua = self.sniffedUserAgent { headers["User-Agent"] = ua } else { headers["User-Agent"] = self.desktopUA }
-                if let ref = self.sniffedReferer ?? self.lastPageURL?.absoluteString { headers["Referer"] = ref }
-                // Origin = scheme + host（不带 path）—— missav 这类 CDN 常和 Referer 一起校验
-                if let page = self.lastPageURL, let scheme = page.scheme, let host = page.host {
-                    headers["Origin"] = "\(scheme)://\(host)"
-                }
-                if !cookies.isEmpty { headers["Cookie"] = cookies }
+            // **关键**：先让 WebView 用浏览器身份 fetch 一次视频 URL，
+            // 触发 Cloudflare 的 __cf_bm 等 bot 检测 cookie 写入 WebView 的 JS cookie store。
+            // 否则我们后面用 URLSession 拉 manifest，没有 cf cookie 就 403 challenge page。
+            self.prefetchInWebView(videoURL) { [weak self] in
+                guard let self = self else { return }
 
-                self.presentAnalysisVC(videoURL: videoURL, headers: headers, startMs: startMs)
+                // 再拿 Cookie（这时应该有 surrit.com 的 __cf_bm 了）
+                self.collectCookies(for: videoURL) { cookies in
+                    var headers: [String: String] = [:]
+                    if let ua = self.sniffedUserAgent { headers["User-Agent"] = ua } else { headers["User-Agent"] = self.desktopUA }
+                    // Referer 必须用 main frame URL —— 广告 iframe 嗅探会污染 sniffedReferer，
+                    // 直接拿 lastPageURL（webView.url）最稳。
+                    if let ref = self.lastPageURL?.absoluteString { headers["Referer"] = ref }
+                    // Origin = scheme + host（不带 path）—— missav 这类 CDN 常和 Referer 一起校验
+                    if let page = self.lastPageURL, let scheme = page.scheme, let host = page.host {
+                        headers["Origin"] = "\(scheme)://\(host)"
+                    }
+                    if !cookies.isEmpty { headers["Cookie"] = cookies }
+
+                    restoreButton()
+                    self.presentAnalysisVC(videoURL: videoURL, headers: headers, startMs: startMs)
+                }
             }
+        }
+    }
+
+    /// 让 WebView 用浏览器身份 fetch 一次视频 URL：
+    ///   1) credentials: 'include' 让 cookie 一起带出去
+    ///   2) 响应里的 Set-Cookie（包括 Cloudflare __cf_bm）写进 WebView 的 cookie store
+    ///   3) 后面我们 collectCookies → URLSession 注入 → 通过 CF 的 bot check
+    /// 即使 fetch 自己得 403（因为我们当时还没 cookie），Set-Cookie 也会生效，
+    /// 用户点开始分析的下一次 URLSession 请求就能 200 了。
+    private func prefetchInWebView(_ url: URL, completion: @escaping () -> Void) {
+        // 转义单引号防 JS 注入
+        let escaped = url.absoluteString
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "'", with: "\\'")
+        let js = """
+        try {
+          const res = await fetch('\(escaped)', { credentials: 'include', cache: 'no-store' });
+          return { ok: res.ok, status: res.status };
+        } catch(e) {
+          return { error: String(e) };
+        }
+        """
+        // 一次性超时兜底：最多等 4 秒
+        var finished = false
+        let timeout = DispatchWorkItem {
+            if !finished {
+                finished = true
+                print("[Prefetch] 超时，跳过继续")
+                completion()
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4.0, execute: timeout)
+
+        webView.callAsyncJavaScript(js, arguments: [:], in: nil, in: .page) { result in
+            if finished { return }
+            finished = true
+            timeout.cancel()
+            switch result {
+            case .success(let value):
+                print("[Prefetch] 完成: \(value)")
+            case .failure(let err):
+                print("[Prefetch] 错误: \(err.localizedDescription)")
+            }
+            completion()
         }
     }
 
