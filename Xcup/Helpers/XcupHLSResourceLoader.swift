@@ -67,7 +67,6 @@ final class XcupHLSResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
             return true
         }
         let realURL = restoreScheme(customURL)
-
         var req = URLRequest(url: realURL)
         req.httpMethod = "GET"
         // 注入用户传入的 headers（Referer / Cookie / User-Agent / Origin 等）
@@ -171,6 +170,7 @@ final class XcupHLSResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
 
         // 设置 contentInformation（如果 AVPlayer 问）
         if let info = loadingRequest.contentInformationRequest {
+            print("ℹ️ [XcupHLS] contentInfoRequest SET for \(realURL.lastPathComponent)")
             if isManifest {
                 info.contentType = http.mimeType?.isEmpty == false
                     ? http.mimeType
@@ -185,18 +185,24 @@ final class XcupHLSResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
             info.contentLength = http.expectedContentLength
             let ranges = (http.value(forHTTPHeaderField: "Accept-Ranges") ?? "").lowercased()
             info.isByteRangeAccessSupported = ranges.contains("bytes")
+        } else {
+            print("ℹ️ [XcupHLS] contentInfoRequest NOT set for \(realURL.lastPathComponent)")
+        }
+
+        // 非 manifest 资源 → 打 16 字节 hex，判断是不是真 TS（0x47 sync byte）
+        if !isManifest, !data.isEmpty {
+            let n = min(data.count, 16)
+            let hex = data.prefix(n).map { String(format: "%02X", $0) }.joined(separator: " ")
+            print("⬇️ [XcupHLS] segment 前 \(n)B (hex): \(hex)")
         }
 
         // 如果是 m3u8 / mpd manifest，重写里面的 URL 让 segment 也走我们
         var payload = data
         if isManifest, let text = String(data: data, encoding: .utf8) {
-            // 诊断：第一次拿到 manifest 时把内容前 800 字符贴出来
-            if text.count <= 800 {
-                print("⬇️ [XcupHLS] manifest 完整内容:\n\(text)")
-            } else {
-                print("⬇️ [XcupHLS] manifest 前 800B:\n\(text.prefix(800))")
-            }
             let rewritten = rewriteManifest(text, baseURL: realURL)
+            // 诊断：原始 + 重写后内容（各取前 400B），方便确认 .ts 别名生效
+            print("⬇️ [XcupHLS] manifest 原始 前 400B:\n\(text.prefix(400))")
+            print("⬇️ [XcupHLS] manifest 重写 前 400B:\n\(rewritten.prefix(400))")
             payload = rewritten.data(using: .utf8) ?? data
         }
 
@@ -232,13 +238,31 @@ final class XcupHLSResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
                 // URL 行（segment 或 variant playlist）
                 if let abs = absoluteURL(from: trimmed, baseURL: baseURL),
                    let custom = toCustomScheme(abs) {
-                    out.append(custom.absoluteString)
+                    // 给伪装成图片的 segment URL 加 .ts 别名，避免 AVPlayer 看 URL 后缀
+                    // 直接把它当图片 short-circuit。restoreScheme 会把 .ts 后缀脱掉再请求。
+                    let aliased = appendSegmentTsAliasIfNeeded(custom)
+                    out.append(aliased.absoluteString)
                 } else {
                     out.append(line)
                 }
             }
         }
         return out.joined(separator: separator)
+    }
+
+    /// 如果 URL 后缀是 image 类（伪装成图片的 segment），追加 ".ts"
+    /// e.g. xcup-https://.../video0.jpeg → xcup-https://.../video0.jpeg.ts
+    /// AVPlayer 这样看后缀就是 .ts，按 MPEG-TS demuxer 解，不会因为 .jpeg 直接拒。
+    private func appendSegmentTsAliasIfNeeded(_ url: URL) -> URL {
+        let path = url.path.lowercased()
+        let imageExts = [".jpeg", ".jpg", ".png", ".webp", ".bmp", ".gif"]
+        for ext in imageExts where path.hasSuffix(ext) {
+            // 拼接 .ts。URLComponents 安全可控。
+            guard var comp = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return url }
+            comp.path = comp.path + ".ts"
+            return comp.url ?? url
+        }
+        return url
     }
 
     /// 替换 EXT-X-KEY 这类标签里的 URI="..."
@@ -283,12 +307,20 @@ final class XcupHLSResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
     }
 
     /// xcup-https://x → https://x （反过来）
+    /// 同时脱掉 appendSegmentTsAliasIfNeeded 给图片伪装 segment 加的 .ts 后缀
     private func restoreScheme(_ url: URL) -> URL {
         guard var comp = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return url }
         switch (comp.scheme ?? "").lowercased() {
         case Self.customSchemeHTTPS: comp.scheme = "https"
         case Self.customSchemeHTTP:  comp.scheme = "http"
         default: break
+        }
+        // 脱 .ts 后缀（如果它是我们贴上去的 image alias）
+        let lower = comp.path.lowercased()
+        let imageExts = [".jpeg.ts", ".jpg.ts", ".png.ts", ".webp.ts", ".bmp.ts", ".gif.ts"]
+        for ext in imageExts where lower.hasSuffix(ext) {
+            comp.path = String(comp.path.dropLast(3))  // 移除尾部的 ".ts"
+            break
         }
         return comp.url ?? url
     }
