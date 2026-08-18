@@ -993,11 +993,16 @@ class OnlineAnalysisViewController: UIViewController {
         if BluetoothManager.shared.isConnected && !BluetoothManager.shared.isPausedByLocal {
             BluetoothManager.shared.sendAction("Noise", 0)
         }
-        // 🆕 静音重置：启动仲裁计数器归零（计数器仅融合线程/主线程访问，
-        // 而本方法可能在 Darwin 通知线程被调用，故派发到主线程）
+        // 🆕 静音重置（对齐 Android 在线模式）：清空动作历史 + 启动仲裁计数器归零。
+        // 本方法可能在 Darwin 通知线程被调用，而计数器约定只在融合线程（主线程）读写，
+        // 故整块派发到主线程；这样融合 tick（同在主线程）也不会插在两者之间看到半清状态。
         DispatchQueue.main.async { [weak self] in
-            self?.audioOnlyDoStreak = 0
-            self?.conflictHoldTicks = 0
+            guard let self else { return }
+            self.historyLock.lock()
+            self.actionHistory.removeAll()
+            self.historyLock.unlock()
+            self.audioOnlyDoStreak = 0
+            self.conflictHoldTicks = 0
         }
         // refreshDiagIfNeeded()
     }
