@@ -50,12 +50,12 @@ class AudioInferenceHelper {
 
     /// 执行一次音频推理流程：YAMNet → 分类器
     /// - Parameter audioBuffer: 长度为 32000 的 Float 数组（2 秒音频）
-    /// - Returns: 最终预测类别索引
-    // 修改返回类型为 (类别索引, 置信度)
-    func predict(audioBuffer: [Float]) -> (Int, Float) {
+    /// - Returns: (类别索引, 置信度, 完整概率数组)
+    ///   probs 顺序为 [sex, oral, noise]；无效结果时 index = -1、probs 为空数组
+    func predict(audioBuffer: [Float]) -> (index: Int, confidence: Float, probs: [Float]) {
         guard audioBuffer.count == INPUT_LENGTH else {
             print("❌ 音频长度不正确，应为 32000，当前为 \(audioBuffer.count)")
-            return (-1, 0)
+            return (-1, 0, [])
         }
 
         do {
@@ -105,14 +105,14 @@ class AudioInferenceHelper {
             if let maxIndex = scores.argmax() {
                 let confidence = scores[maxIndex] // 概率分布中最大值
                 //print("✅ 音频推理结果: 类别 \(maxIndex), 置信度 \(confidence)")
-                return (maxIndex, confidence)
+                return (maxIndex, confidence, scores)
             } else {
-                return (-1, 0)
+                return (-1, 0, [])
             }
 
         } catch {
             print("❌ 音频推理失败: \(error)")
-            return (-1, 0)
+            return (-1, 0, [])
         }
     }
 

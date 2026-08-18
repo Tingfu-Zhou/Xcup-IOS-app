@@ -73,9 +73,9 @@ class OnlineAnalysisViewController: UIViewController {
     private let videoAnalysisQueue = DispatchQueue(label: "com.xcup.online.video",  qos: .userInitiated)
     private let audioAnalysisQueue = DispatchQueue(label: "com.xcup.online.audio",  qos: .userInitiated)
     private let VIDEO_INTERVAL_MS:    Int64 = 250    // 抽帧轮询 250ms
-    private let VIDEO_INFER_STEP_MS:  Int64 = 1000   // 推理步长 1s
+    private let VIDEO_INFER_STEP_MS:  Int64 = 500    // 推理步长 500ms（相邻窗口重叠 10/12 帧）
     private let AUDIO_INTERVAL_MS:    Int64 = 1000
-    private let FUSION_INTERVAL_MS:   Int64 = 1000   // 主线程融合 1s
+    private let FUSION_INTERVAL_MS:   Int64 = 500    // 主线程融合 500ms（2 Hz）
     private var videoLoopItem:  DispatchWorkItem?
     private var audioLoopItem:  DispatchWorkItem?
     private var fusionLoopItem: DispatchWorkItem?
@@ -85,10 +85,11 @@ class OnlineAnalysisViewController: UIViewController {
     private var frameBuffer: [UIImage] = []
     private var lastVideoInferenceMs: Int64 = 0
 
-    // MARK: - 阈值（与 VideoProcessViewController 一致）
-    private let VIDEO_CONF_TH:     Float = 0.4
-    private let AUDIO_TH_NOISE:    Float = 0.6
-    private let AUDIO_TH_ACTION:   Float = 0.5
+    // MARK: - 分组概率阈值（与 VideoProcessViewController 一致：在归并后的分组概率上判定）
+    private let VIDEO_DO_PROB_THRESHOLD:    Float = 0.65  // P(oral)+P(sex) ≥ 0.65 → "do"
+    private let VIDEO_PLOT_PROB_THRESHOLD:  Float = 0.60  // P(plot) ≥ 0.60 → "Noise"
+    private let AUDIO_DO_PROB_THRESHOLD:    Float = 0.55  // P(sex)+P(oral) ≥ 0.55 → "do"
+    private let AUDIO_NOISE_PROB_THRESHOLD: Float = 0.60  // P(noise) ≥ 0.60 → "Noise"
 
     // MARK: - 分析暂停状态
     private let stateLock = NSLock()
@@ -108,8 +109,24 @@ class OnlineAnalysisViewController: UIViewController {
     // MARK: - 平滑融合
     private var actionHistory: [ActionRecord] = []
     private let historyLock  = NSLock()
-    private let SMOOTH_WINDOW_SIZE = 10
+    private let SMOOTH_WINDOW_SIZE = 6           // 6 条 × 500ms ≈ 3 秒
+    private let SMOOTH_MIN_COUNT = 3             // 投票最少出现次数
     private var latestBluetoothAction = ""
+
+    // MARK: - 一致性快通道（音视频同 tick 高置信度一致时绕过窗口投票）
+    private let FUSION_FASTPATH_VIDEO_CONF: Float = 0.70
+    private let FUSION_FASTPATH_AUDIO_CONF: Float = 0.70
+
+    // MARK: - 启动仲裁（applyDoStartGate，与 VideoProcessViewController 一致）
+    // 设计前提：实测音频模型准确度高于视频模型，视频不拥有启动否决权，
+    // 只能在强冲突时把启动短暂推迟，且推迟有硬上限（绝不永久阻塞）。
+    private let VIDEO_PLOT_CONFLICT_CONF: Float = 0.80   // 构成「强冲突」所需的视频剧情置信度
+    private let FUSION_CONFLICT_MARGIN: Float = 0.15     // 视频需领先音频的置信度差
+    private let CONFLICT_MAX_HOLD_TICKS = 4              // 冲突延迟上限，超过后强制放行
+    private let AUDIO_STRONG_START_CONF: Float = 0.75    // 强音频直通启动门槛
+    private let AUDIO_ONLY_START_TICKS = 2               // 弱证据启动所需连续 tick 数
+    private var audioOnlyDoStreak = 0                    // 弱证据 do 连续计数（仅融合线程访问）
+    private var conflictHoldTicks = 0                    // 强冲突连续计数（仅融合线程访问）
 
     // MARK: - 蓝牙状态管理
     private var pendingBluetoothState  = ""
@@ -793,8 +810,8 @@ class OnlineAnalysisViewController: UIViewController {
     //
     // 每 250ms 一轮：取一帧 → 缩放到 160×160 → 推入环形缓冲（最多 12 帧 = 3 秒窗口）
     //   若 缓冲 < 12 帧：return（预热）
-    //   若 now - lastVideoInferenceMs < 1000ms：return
-    //   否则：classifier.predict(12帧) → applyVideoResult()
+    //   若 now - lastVideoInferenceMs < 500ms：return
+    //   否则：classifier.predict(12帧) → 分组概率决策
     private func performVideoAnalysis() {
         frameLock.lock()
         let frame = latestFrame
@@ -817,7 +834,7 @@ class OnlineAnalysisViewController: UIViewController {
         // 3. 预热不足
         if frameBuffer.count < FRAME_BUFFER_SIZE { return }
 
-        // 4. 推理步长门控（1000ms）
+        // 4. 推理步长门控（500ms）
         let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
         if nowMs - lastVideoInferenceMs < VIDEO_INFER_STEP_MS { return }
         lastVideoInferenceMs = nowMs
@@ -831,26 +848,30 @@ class OnlineAnalysisViewController: UIViewController {
         let inferMs = Date().timeIntervalSince(inferStart) * 1000
         let probs = result.probs
 
-        // 6. 阈值映射（单一阈值 0.4，低于则 unclear）
-        //    索引 0=normal_plot -> "Noise"（不转）
-        //    索引 1=oral / 2=sex -> "do"（转）
+        // 6. 分组概率决策（类目顺序 [plot, oral, sex]）
+        //    pDo = P(oral)+P(sex)，pPlot = P(plot)
+        //    判定顺序固定：先 do、后 Noise、否则 unclear；置信度取分组后的概率
         let action: String
         let confidence: Float
 
-        if result.index < 0 {
+        if result.index < 0 || probs.count < 3 {
             action = ""
             confidence = 0
-        } else if result.confidence < VIDEO_CONF_TH {
-            action = ""
-            confidence = 0
-            print(String(format: "📸 [在线-视频] unclear: 最大概率=%.3f < 阈值=%.2f (idx=%d)",
-                         result.confidence, VIDEO_CONF_TH, result.index))
-        } else if result.index == 0 {
-            action = "Noise"
-            confidence = result.confidence
         } else {
-            action = "do"
-            confidence = result.confidence
+            let pDo = probs[1] + probs[2]
+            let pPlot = probs[0]
+            if pDo >= VIDEO_DO_PROB_THRESHOLD {
+                action = "do"
+                confidence = pDo
+            } else if pPlot >= VIDEO_PLOT_PROB_THRESHOLD {
+                action = "Noise"
+                confidence = pPlot
+            } else {
+                action = ""
+                confidence = 0
+                print(String(format: "📸 [在线-视频] unclear: pDo=%.3f < %.2f 且 pPlot=%.3f < %.2f",
+                             pDo, VIDEO_DO_PROB_THRESHOLD, pPlot, VIDEO_PLOT_PROB_THRESHOLD))
+            }
         }
 
         print(String(format: "📸 [在线-视频] 推理 %.1fms | %@ p=%.3f | normal=%.3f oral=%.3f sex=%.3f",
@@ -874,40 +895,34 @@ class OnlineAnalysisViewController: UIViewController {
 
     // MARK: - 音频分析
     //
-    // YAMNet + 微调分类器输出索引：0=do(sex), 1=oral, 2=Noise
-    //   index<0 → "" (unclear)
-    //   index==2 noise: 置信度 ≥ AUDIO_TH_NOISE → "Noise"
-    //   index==0/1 sex/oral: 置信度 ≥ AUDIO_TH_ACTION → "do"
+    // 分组概率决策（类目顺序 [sex, oral, noise]）
+    //   pDo = P(sex)+P(oral)，pNoise = P(noise)
+    //   pDo ≥ 0.55 → "do"；否则 pNoise ≥ 0.60 → "Noise"；否则 "" (unclear)
     private func performAudioAnalysis() {
         let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
         if let segment = pcmBuffer.readWindowRelaxed(currentTimeMs: nowMs, sampleCount: 32000) {
-            let (index, confidence) = audioHelper.predict(audioBuffer: segment)
+            let (index, confidence, probs) = audioHelper.predict(audioBuffer: segment)
 
             let action: String
             let outConf: Float
 
-            if index < 0 {
+            if index < 0 || probs.count < 3 {
                 action = ""
                 outConf = 0
-            } else if index == 2 {
-                if confidence >= AUDIO_TH_NOISE {
-                    action = "Noise"
-                    outConf = confidence
-                } else {
-                    action = ""
-                    outConf = 0
-                    print(String(format: "🎵 [在线-音频] Noise unclear: p=%.3f < %.2f",
-                                 confidence, AUDIO_TH_NOISE))
-                }
             } else {
-                if confidence >= AUDIO_TH_ACTION {
+                let pDo = probs[0] + probs[1]
+                let pNoise = probs[2]
+                if pDo >= AUDIO_DO_PROB_THRESHOLD {
                     action = "do"
-                    outConf = confidence
+                    outConf = pDo
+                } else if pNoise >= AUDIO_NOISE_PROB_THRESHOLD {
+                    action = "Noise"
+                    outConf = pNoise
                 } else {
                     action = ""
                     outConf = 0
-                    print(String(format: "🎵 [在线-音频] do unclear: p=%.3f < %.2f (idx=%d)",
-                                 confidence, AUDIO_TH_ACTION, index))
+                    print(String(format: "🎵 [在线-音频] unclear: pDo=%.3f < %.2f 且 pNoise=%.3f < %.2f",
+                                 pDo, AUDIO_DO_PROB_THRESHOLD, pNoise, AUDIO_NOISE_PROB_THRESHOLD))
                 }
             }
 
@@ -958,7 +973,12 @@ class OnlineAnalysisViewController: UIViewController {
         // if aAction == "oral" { aAction = "do" }
 
         let finalFreq   = computeFinalFreq(audioHz: aLevel, audioConf: aLConf, videoHz: .nan, videoConf: 0)
-        let finalAction = smoothedFusion(videoAction: vAction, audioAction: aAction, videoConf: vConf, audioConf: aConf)
+        var finalAction = smoothedFusion(videoAction: vAction, audioAction: aAction, videoConf: vConf, audioConf: aConf)
+
+        // 🆕 启动仲裁：仅约束「非 do 状态 → 启动 do」；维持阶段音频可单独维持
+        finalAction = applyDoStartGate(finalAction: finalAction,
+                                       videoAction: vAction, videoConf: vConf,
+                                       audioAction: aAction, audioConf: aConf)
 
         if !finalAction.isEmpty { updateBluetoothState(finalAction, finalFreq) }
         tvOverlay.text = latestBluetoothAction.isEmpty
@@ -972,6 +992,12 @@ class OnlineAnalysisViewController: UIViewController {
         isAnalysisPaused = true
         if BluetoothManager.shared.isConnected && !BluetoothManager.shared.isPausedByLocal {
             BluetoothManager.shared.sendAction("Noise", 0)
+        }
+        // 🆕 静音重置：启动仲裁计数器归零（计数器仅融合线程/主线程访问，
+        // 而本方法可能在 Darwin 通知线程被调用，故派发到主线程）
+        DispatchQueue.main.async { [weak self] in
+            self?.audioOnlyDoStreak = 0
+            self?.conflictHoldTicks = 0
         }
         // refreshDiagIfNeeded()
     }
@@ -1076,6 +1102,18 @@ class OnlineAnalysisViewController: UIViewController {
                                           videoConfidence: videoConf, audioConfidence: audioConf,
                                           timestamp: Date().timeIntervalSince1970))
         while actionHistory.count > SMOOTH_WINDOW_SIZE { actionHistory.removeFirst() }
+
+        // 🆕 一致性快通道：两个模态同 tick 高置信度一致时没有抖动嫌疑，不必攒票。
+        // 注意：本 tick 的记录已先入窗（见上），保证窗口不漏账。
+        if !videoAction.isEmpty
+            && videoAction == audioAction
+            && videoConf >= FUSION_FASTPATH_VIDEO_CONF
+            && audioConf >= FUSION_FASTPATH_AUDIO_CONF {
+            print(String(format: "[快通道] 音视频一致 %@ (v=%.2f a=%.2f)，绕过窗口投票",
+                         videoAction, videoConf, audioConf))
+            return videoAction
+        }
+
         if actionHistory.count < 3 {
             return selectBestAction(vA: videoAction, aA: audioAction, vC: videoConf, aC: audioConf)
         }
@@ -1092,7 +1130,7 @@ class OnlineAnalysisViewController: UIViewController {
             }
         }
         var best = ""; var bestScore: Float = 0
-        for (a, s) in scores { if (counts[a] ?? 0) >= 3 && s > bestScore { bestScore = s; best = a } }
+        for (a, s) in scores { if (counts[a] ?? 0) >= SMOOTH_MIN_COUNT && s > bestScore { bestScore = s; best = a } }
         if best.isEmpty, let last = actionHistory.last {
             best = selectBestAction(vA: last.videoAction, aA: last.audioAction,
                                     vC: last.videoConfidence, aC: last.audioConfidence)
@@ -1104,6 +1142,75 @@ class OnlineAnalysisViewController: UIViewController {
         if !aA.isEmpty && (aA != "Noise" || aC > 0.7) { return aA }
         if !vA.isEmpty && vA != "Background" && (vA != "Noise" || vC > 0.7) { return vA }
         if aA == "Noise" || vA == "Noise" { return "Noise" }
+        return ""
+    }
+
+    // 🆕 MARK: - 启动仲裁：applyDoStartGate（与 VideoProcessViewController 一致）
+    // 作用范围仅限「从非 do 状态启动 do」；已在 do 状态时（维持阶段）音频可单独维持，不受任何限制。
+    // 设计前提：实测音频模型准确度高于视频模型 —— 视频不拥有否决权，
+    // 只能在与音频强烈冲突时把启动短暂推迟，且推迟有硬上限（最坏 4+2=6 tick ≈ 3 秒后必然放行）。
+    // 返回 "" 表示本 tick 不驱动蓝牙状态机（融合循环对空结果直接跳过发送），维持现状，不主动发 Noise。
+    // 两个计数器只在融合线程（主线程）读写，无需加锁；窗口证据检索需持有 historyLock。
+    private func applyDoStartGate(finalAction: String,
+                                  videoAction: String, videoConf: Float,
+                                  audioAction: String, audioConf: Float) -> String {
+        if finalAction != "do" {
+            audioOnlyDoStreak = 0
+            conflictHoldTicks = 0
+            return finalAction
+        }
+        // 「当前蓝牙状态已是 do」读的是状态机已确认执行中的动作，不是融合输出
+        if currentBluetoothState == "do" {
+            audioOnlyDoStreak = 0
+            conflictHoldTicks = 0
+            return finalAction
+        }
+
+        // —— 以下为启动阶段 ——
+        let audioDoConf: Float = (audioAction == "do") ? audioConf : 0
+
+        // 规则1 强冲突延迟（有上限，绝不永久阻塞）
+        let strongConflict = videoAction == "Noise"
+            && videoConf >= VIDEO_PLOT_CONFLICT_CONF
+            && (videoConf - audioDoConf) >= FUSION_CONFLICT_MARGIN
+        if strongConflict {
+            conflictHoldTicks += 1
+            if conflictHoldTicks <= CONFLICT_MAX_HOLD_TICKS {
+                print(String(format: "[启动仲裁] 强冲突：视频剧情 %.2f vs 音频 do %.2f，延迟启动 (%d/%d)",
+                             videoConf, audioDoConf, conflictHoldTicks, CONFLICT_MAX_HOLD_TICKS))
+                return ""   // 本 tick 不启动
+            }
+            // 超过上限 → 视频可能在系统性误判，按「音频更可信」继续往下走规则 2–4
+            print("[启动仲裁] 强冲突超过上限，视频可能在系统性误判，按音频证据继续")
+        } else {
+            conflictHoldTicks = 0
+        }
+
+        // 规则2 强音频直通
+        if audioDoConf >= AUDIO_STRONG_START_CONF {
+            audioOnlyDoStreak = 0
+            print(String(format: "[启动仲裁] 音频 do 置信度 %.2f 达直通门槛 %.2f，放行",
+                         audioDoConf, AUDIO_STRONG_START_CONF))
+            return finalAction
+        }
+
+        // 规则3 视频证据放行（平滑窗口内存在任一条 videoAction == "do"）
+        historyLock.lock()
+        let hasVideoDoEvidence = actionHistory.contains { $0.videoAction == "do" }
+        historyLock.unlock()
+        if hasVideoDoEvidence {
+            audioOnlyDoStreak = 0
+            print("[启动仲裁] 平滑窗口内存在视频 do 证据，放行")
+            return finalAction
+        }
+
+        // 规则4 弱证据兜底
+        audioOnlyDoStreak += 1
+        if audioOnlyDoStreak >= AUDIO_ONLY_START_TICKS {
+            print(String(format: "[启动仲裁] 弱证据连续 %d tick，兜底放行", audioOnlyDoStreak))
+            return finalAction
+        }
+        print(String(format: "[启动仲裁] 弱证据 %d/%d tick，暂不启动", audioOnlyDoStreak, AUDIO_ONLY_START_TICKS))
         return ""
     }
 

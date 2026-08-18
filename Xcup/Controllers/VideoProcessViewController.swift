@@ -200,25 +200,26 @@ class VideoProcessViewController: UIViewController {
     
     // ===================== [12.14] 自调度循环（替代 repeating timer） =====================
     private let VIDEO_INTERVAL_MS: Int64 = 250           // 视频抽帧轮询 250ms
-    private let VIDEO_INFER_STEP_MS: Int64 = 1000        // 视频推理步长 1s
+    private let VIDEO_INFER_STEP_MS: Int64 = 500         // 视频推理步长 500ms（相邻窗口重叠 10/12 帧）
     private let AUDIO_INTERVAL_MS: Int64 = 1000          // 音频 1s
-    private let FUSION_INTERVAL_MS: Int64 = 1000         // 融合 1s
+    private let FUSION_INTERVAL_MS: Int64 = 500          // 融合 500ms（2 Hz）
 
     private var videoLoopWorkItem: DispatchWorkItem?
     private var audioLoopWorkItem: DispatchWorkItem?
     private var fusionLoopWorkItem: DispatchWorkItem?
 
-    // MARK: - 视频分类滑动窗口（12 帧 × 160×160 × RGB，3s 窗口，1s 推理步长）
+    // MARK: - 视频分类滑动窗口（12 帧 × 160×160 × RGB，3s 窗口，500ms 推理步长）
     private let FRAME_BUFFER_SIZE: Int = VideoClassifierHelper.TIME  // 12
     private var frameBuffer: [UIImage] = []
     private var lastVideoInferenceMs: Int64 = 0
 
-    // MARK: - 视频置信度阈值（单一阈值 0.4，低于即视为 unclear）
-    private let VIDEO_CONF_TH: Float = 0.4
+    // MARK: - 视频分组概率阈值（与 Android 对齐：在 oral/sex 归并后的分组概率上判定）
+    private let VIDEO_DO_PROB_THRESHOLD: Float = 0.65    // P(oral)+P(sex) ≥ 0.65 → "do"
+    private let VIDEO_PLOT_PROB_THRESHOLD: Float = 0.60  // P(plot) ≥ 0.60 → "Noise"
 
-    // MARK: - 音频置信度阈值（与 Android 对齐）
-    private let AUDIO_TH_NOISE: Float = 0.6              // 噪音类：>=0.6 才认定为 Noise
-    private let AUDIO_TH_ACTION: Float = 0.5             // sex/oral：>=0.5 才认定为 do
+    // MARK: - 音频分组概率阈值（与 Android 对齐）
+    private let AUDIO_DO_PROB_THRESHOLD: Float = 0.55    // P(sex)+P(oral) ≥ 0.55 → "do"
+    private let AUDIO_NOISE_PROB_THRESHOLD: Float = 0.60 // P(noise) ≥ 0.60 → "Noise"
 
     /* ---- 旧版姿态窗口（ST-GCN++）已弃用 ----
     var poseWindow: [PoseFrame] = []
@@ -235,11 +236,24 @@ class VideoProcessViewController: UIViewController {
     // MARK: - 平滑融合相关
     private var actionHistory = [ActionRecord]()  // 动作历史记录
     private let historyLock = NSLock()           // 历史记录锁
-    private let SMOOTH_WINDOW_SIZE = 10          // 窗口大小（10帧 = 1秒）
+    private let SMOOTH_WINDOW_SIZE = 6           // 窗口大小（6 条 × 500ms ≈ 3 秒）
+    private let SMOOTH_MIN_COUNT = 3             // 投票最少出现次数
     private var latestBluetoothAction = ""       // 最新的蓝牙发送动作
-    
-    // MARK: -主线程融合循环间隔（秒）
-    private let FUSION_INTERVAL: TimeInterval = 1.0  // 1000ms
+
+    // MARK: - 一致性快通道（音视频同 tick 高置信度一致时绕过窗口投票）
+    private let FUSION_FASTPATH_VIDEO_CONF: Float = 0.70
+    private let FUSION_FASTPATH_AUDIO_CONF: Float = 0.70
+
+    // MARK: - 启动仲裁（applyDoStartGate）
+    // 设计前提：实测音频模型准确度高于视频模型，视频不拥有启动否决权，
+    // 只能在强冲突时把启动短暂推迟，且推迟有硬上限（绝不永久阻塞）。
+    private let VIDEO_PLOT_CONFLICT_CONF: Float = 0.80   // 构成「强冲突」所需的视频剧情置信度
+    private let FUSION_CONFLICT_MARGIN: Float = 0.15     // 视频需领先音频的置信度差
+    private let CONFLICT_MAX_HOLD_TICKS = 4              // 冲突延迟上限，超过后强制放行
+    private let AUDIO_STRONG_START_CONF: Float = 0.75    // 强音频直通启动门槛
+    private let AUDIO_ONLY_START_TICKS = 2               // 弱证据启动所需连续 tick 数
+    private var audioOnlyDoStreak = 0                    // 弱证据 do 连续计数（仅融合线程访问）
+    private var conflictHoldTicks = 0                    // 强冲突连续计数（仅融合线程访问）
     
     // MARK: - 蓝牙状态管理相关
     private var pendingBluetoothState = ""           // 待确认的蓝牙状态
@@ -554,7 +568,7 @@ class VideoProcessViewController: UIViewController {
     // MARK: - 启动分析线程
     func startAnalysisThreads() {
         startVideoLoop()
-        startAudioLoop()     //（保留 4s 预热延迟）
+        startAudioLoop()     //（保留 2s 预热延迟）
         startFusionLoop()
     }
     
@@ -652,8 +666,8 @@ class VideoProcessViewController: UIViewController {
     //
     // 每 250ms 一轮：抽 1 帧 → 缩放到 160×160 → 推入环形缓冲（最多 12 帧 = 3 秒窗口）
     //   若 缓冲 < 12 帧：return（预热）
-    //   若 now - lastVideoInferenceMs < 1000ms：return
-    //   否则：classifier.predict(12帧) → applyVideoResult()
+    //   若 now - lastVideoInferenceMs < 500ms：return
+    //   否则：classifier.predict(12帧) → 分组概率决策
     func performVideoAnalysis() {
         guard !isAnalysisPaused else { return }
 
@@ -694,7 +708,7 @@ class VideoProcessViewController: UIViewController {
             return
         }
 
-        // 5. 推理步长门控（1000ms）
+        // 5. 推理步长门控（500ms）
         let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
         if nowMs - lastVideoInferenceMs < VIDEO_INFER_STEP_MS {
             return
@@ -710,28 +724,30 @@ class VideoProcessViewController: UIViewController {
         let inferMs = Date().timeIntervalSince(inferStart) * 1000
         let probs = result.probs
 
-        // 7. 阈值映射（单一阈值 0.4，低于则 unclear）
-        //    索引 0=normal_plot -> "Noise"（不转）
-        //    索引 1=oral / 2=sex -> "do"（转）
-        //    低于阈值 -> ""（unclear），融合层自然消化
+        // 7. 分组概率决策（类目顺序 [plot, oral, sex]）
+        //    pDo = P(oral)+P(sex)，pPlot = P(plot)
+        //    判定顺序固定：先 do、后 Noise、否则 unclear；置信度取分组后的概率
         let action: String
         let confidence: Float
 
-        if result.index < 0 {
+        if result.index < 0 || probs.count < 3 {
             action = ""
             confidence = 0
-        } else if result.confidence < VIDEO_CONF_TH {
-            action = ""
-            confidence = 0
-            print(String(format: "📸 视频 unclear: 最大概率=%.3f < 阈值=%.2f (idx=%d)",
-                         result.confidence, VIDEO_CONF_TH, result.index))
-        } else if result.index == 0 {
-            action = "Noise"
-            confidence = result.confidence
         } else {
-            // index == 1 (oral) 或 2 (sex)
-            action = "do"
-            confidence = result.confidence
+            let pDo = probs[1] + probs[2]
+            let pPlot = probs[0]
+            if pDo >= VIDEO_DO_PROB_THRESHOLD {
+                action = "do"
+                confidence = pDo
+            } else if pPlot >= VIDEO_PLOT_PROB_THRESHOLD {
+                action = "Noise"
+                confidence = pPlot
+            } else {
+                action = ""
+                confidence = 0
+                print(String(format: "📸 视频 unclear: pDo=%.3f < %.2f 且 pPlot=%.3f < %.2f",
+                             pDo, VIDEO_DO_PROB_THRESHOLD, pPlot, VIDEO_PLOT_PROB_THRESHOLD))
+            }
         }
 
         print(String(format: "📸 [视频线程] 推理 %.1fms | %@ p=%.3f | normal=%.3f oral=%.3f sex=%.3f",
@@ -754,51 +770,46 @@ class VideoProcessViewController: UIViewController {
         let currentTime = player.currentTime().seconds
         let currentTimeMs = Int64(currentTime * 1000)
         
-        if currentTimeMs - audioStartTime < 4000 {
+        // 音频死区 2s：模型窗口只需要 [T-2s, T] 共 2 秒数据，
+        // readWindowRelaxed 在有效样本不足 90% 时返回 null 自我保护，等满 2 秒即可开始尝试
+        if currentTimeMs - audioStartTime < 2000 {
             print("⏳ [音频线程] 等待 PCM 缓冲填充中")
             return
         }
-        
+
         let segment = pcmBuffer.readWindowRelaxed(currentTimeMs: currentTimeMs, sampleCount: 32000)
         if let segment = segment {
             let yamnetStart = Date()
 
-            let (index, confidence) = audioHelper.predict(audioBuffer: segment)
+            let (index, confidence, probs) = audioHelper.predict(audioBuffer: segment)
 
             let yamnetTime = Date().timeIntervalSince(yamnetStart) * 1000
             //print(String(format: "🎵 [音频线程] YAMNet 音频分析耗时: %.2f ms", yamnetTime))
 
-            // YAMNet + 微调分类器输出索引：0=do(sex), 1=oral, 2=Noise
-            //   index<0 → "" (unclear)
-            //   index==2 noise: 置信度 ≥ AUDIO_TH_NOISE → "Noise"，否则 unclear
-            //   index==0/1 sex/oral: 置信度 ≥ AUDIO_TH_ACTION → "do"，否则 unclear
+            // 分组概率决策（类目顺序 [sex, oral, noise]）
+            //   pDo = P(sex)+P(oral)，pNoise = P(noise)
+            //   判定顺序固定：先 do、后 Noise、否则 unclear；置信度取分组后的概率
             let action: String
             let outConf: Float
 
-            if index < 0 {
+            if index < 0 || probs.count < 3 {
                 action = ""
                 outConf = 0
-                print("⚠️ [音频线程] 音频分析返回了无效索引: \(index)")
-            } else if index == 2 {
-                if confidence >= AUDIO_TH_NOISE {
-                    action = "Noise"
-                    outConf = confidence
-                } else {
-                    action = ""
-                    outConf = 0
-                    print(String(format: "🎵 [音频线程] Noise unclear: p=%.3f < %.2f",
-                                 confidence, AUDIO_TH_NOISE))
-                }
+                print("⚠️ [音频线程] 音频分析返回了无效结果: idx=\(index), probs=\(probs.count)")
             } else {
-                // index == 0 (sex) 或 1 (oral) → "do"
-                if confidence >= AUDIO_TH_ACTION {
+                let pDo = probs[0] + probs[1]
+                let pNoise = probs[2]
+                if pDo >= AUDIO_DO_PROB_THRESHOLD {
                     action = "do"
-                    outConf = confidence
+                    outConf = pDo
+                } else if pNoise >= AUDIO_NOISE_PROB_THRESHOLD {
+                    action = "Noise"
+                    outConf = pNoise
                 } else {
                     action = ""
                     outConf = 0
-                    print(String(format: "🎵 [音频线程] do unclear: p=%.3f < %.2f (idx=%d)",
-                                 confidence, AUDIO_TH_ACTION, index))
+                    print(String(format: "🎵 [音频线程] unclear: pDo=%.3f < %.2f 且 pNoise=%.3f < %.2f",
+                                 pDo, AUDIO_DO_PROB_THRESHOLD, pNoise, AUDIO_NOISE_PROB_THRESHOLD))
                 }
             }
 
@@ -940,13 +951,22 @@ class VideoProcessViewController: UIViewController {
         }
             
         // 🆕 使用平滑融合逻辑
-        let finalAction = smoothedFusion(
+        var finalAction = smoothedFusion(
             videoAction: filteredVideoAction,
             audioAction: filteredAudioAction,
             videoConf: filteredVideoConfidence,
             audioConf: filteredAudioConfidence
         )
-            
+
+        // 🆕 启动仲裁：仅约束「非 do 状态 → 启动 do」；维持阶段音频可单独维持
+        finalAction = applyDoStartGate(
+            finalAction: finalAction,
+            videoAction: filteredVideoAction,
+            videoConf: filteredVideoConfidence,
+            audioAction: filteredAudioAction,
+            audioConf: filteredAudioConfidence
+        )
+
         // 🆕 使用稳定的蓝牙发送策略
         if !finalAction.isEmpty {
             updateBluetoothState(finalAction, finalfreq)
@@ -1069,12 +1089,24 @@ class VideoProcessViewController: UIViewController {
             timestamp: Date().timeIntervalSince1970
         )
         actionHistory.append(record)
-            
+
         // 保持窗口大小
         while actionHistory.count > SMOOTH_WINDOW_SIZE {
             actionHistory.removeFirst()
         }
-            
+
+        // 🆕 一致性快通道：两个模态同 tick 高置信度一致时没有抖动嫌疑，不必攒票。
+        // 注意：本 tick 的记录已先入窗（见上），保证窗口不漏账。
+        // 对 "do" 与 "Noise" 都生效；停转方向的安全性仍由蓝牙状态机兜底。
+        if !videoAction.isEmpty
+            && videoAction == audioAction
+            && videoConf >= FUSION_FASTPATH_VIDEO_CONF
+            && audioConf >= FUSION_FASTPATH_AUDIO_CONF {
+            print(String(format: "[快通道] 音视频一致 %@ (v=%.2f a=%.2f)，绕过窗口投票",
+                         videoAction, videoConf, audioConf))
+            return videoAction
+        }
+
         // 如果历史记录太少，使用原始逻辑
         if actionHistory.count < 3 {
             return selectBestAction(
@@ -1124,9 +1156,9 @@ class VideoProcessViewController: UIViewController {
             
         for (action, score) in actionScores {
             let count = actionCounts[action] ?? 0
-                
-            // 需要至少出现3次才考虑（避免偶然噪声）
-            if count >= 3 && score > bestScore {
+
+            // 需要至少出现 SMOOTH_MIN_COUNT 次才考虑（避免偶然噪声）
+            if count >= SMOOTH_MIN_COUNT && score > bestScore {
                 bestScore = score
                 bestAction = action
             }
@@ -1171,11 +1203,80 @@ class VideoProcessViewController: UIViewController {
         if audioAction == "Noise" || videoAction == "Noise" {
             return "Noise"
         }
-            
+
         return ""
     }
-    
-    
+
+    // 🆕 MARK: - 启动仲裁：applyDoStartGate
+    // 作用范围仅限「从非 do 状态启动 do」；已在 do 状态时（维持阶段）音频可单独维持，不受任何限制。
+    // 设计前提：实测音频模型准确度高于视频模型 —— 视频不拥有否决权，
+    // 只能在与音频强烈冲突时把启动短暂推迟，且推迟有硬上限（最坏 4+2=6 tick ≈ 3 秒后必然放行）。
+    // 返回 "" 表示本 tick 不驱动蓝牙状态机（融合循环对空结果直接跳过发送），维持现状，不主动发 Noise。
+    // 两个计数器只在融合线程（主线程）读写，无需加锁；窗口证据检索需持有 historyLock。
+    private func applyDoStartGate(finalAction: String,
+                                  videoAction: String, videoConf: Float,
+                                  audioAction: String, audioConf: Float) -> String {
+        if finalAction != "do" {
+            audioOnlyDoStreak = 0
+            conflictHoldTicks = 0
+            return finalAction
+        }
+        // 「当前蓝牙状态已是 do」读的是状态机已确认执行中的动作，不是融合输出
+        if currentBluetoothState == "do" {
+            audioOnlyDoStreak = 0
+            conflictHoldTicks = 0
+            return finalAction
+        }
+
+        // —— 以下为启动阶段 ——
+        let audioDoConf: Float = (audioAction == "do") ? audioConf : 0
+
+        // 规则1 强冲突延迟（有上限，绝不永久阻塞）
+        let strongConflict = videoAction == "Noise"
+            && videoConf >= VIDEO_PLOT_CONFLICT_CONF
+            && (videoConf - audioDoConf) >= FUSION_CONFLICT_MARGIN
+        if strongConflict {
+            conflictHoldTicks += 1
+            if conflictHoldTicks <= CONFLICT_MAX_HOLD_TICKS {
+                print(String(format: "[启动仲裁] 强冲突：视频剧情 %.2f vs 音频 do %.2f，延迟启动 (%d/%d)",
+                             videoConf, audioDoConf, conflictHoldTicks, CONFLICT_MAX_HOLD_TICKS))
+                return ""   // 本 tick 不启动
+            }
+            // 超过上限 → 视频可能在系统性误判，按「音频更可信」继续往下走规则 2–4
+            print("[启动仲裁] 强冲突超过上限，视频可能在系统性误判，按音频证据继续")
+        } else {
+            conflictHoldTicks = 0
+        }
+
+        // 规则2 强音频直通
+        if audioDoConf >= AUDIO_STRONG_START_CONF {
+            audioOnlyDoStreak = 0
+            print(String(format: "[启动仲裁] 音频 do 置信度 %.2f 达直通门槛 %.2f，放行",
+                         audioDoConf, AUDIO_STRONG_START_CONF))
+            return finalAction
+        }
+
+        // 规则3 视频证据放行（平滑窗口内存在任一条 videoAction == "do"）
+        historyLock.lock()
+        let hasVideoDoEvidence = actionHistory.contains { $0.videoAction == "do" }
+        historyLock.unlock()
+        if hasVideoDoEvidence {
+            audioOnlyDoStreak = 0
+            print("[启动仲裁] 平滑窗口内存在视频 do 证据，放行")
+            return finalAction
+        }
+
+        // 规则4 弱证据兜底
+        audioOnlyDoStreak += 1
+        if audioOnlyDoStreak >= AUDIO_ONLY_START_TICKS {
+            print(String(format: "[启动仲裁] 弱证据连续 %d tick，兜底放行", audioOnlyDoStreak))
+            return finalAction
+        }
+        print(String(format: "[启动仲裁] 弱证据 %d/%d tick，暂不启动", audioOnlyDoStreak, AUDIO_ONLY_START_TICKS))
+        return ""
+    }
+
+
     // MARK: - 更新蓝牙状态 - 二级平滑策略
     private func updateBluetoothState(_ newAction: String, _ finalFreq: Int) {
         let currentTime = Date().timeIntervalSince1970 * 1000  // ms
@@ -1467,7 +1568,11 @@ class VideoProcessViewController: UIViewController {
             self.analysisResults.resetRhythm()
             
             self.lastFinalAction = ""
-            
+
+            // 🆕 重置启动仲裁计数器（与清空动作历史同步；work item 在主线程执行）
+            self.audioOnlyDoStreak = 0
+            self.conflictHoldTicks = 0
+
             // 在 handleUserSeek(...) 的后台线程清理块中追加：
             // 重置档位确认状态
             self.currentLevel = 1
